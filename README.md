@@ -1,8 +1,3 @@
-Sonic Harvest: DeFi Yield Farming Aggregator
-Solidity
-License
-Sonic Blockchain
-Status
 Sonic Harvest is a decentralized finance (DeFi) yield farming aggregator optimized for the Sonic Blockchain. It maximizes yield by dynamically allocating funds across multiple protocols, including Aave V3, Compound, FlyingTulip, real-world asset (RWA) protocols, and Sonic-native DeFi protocols. Leveraging Sonic’s Fee Monetization, native USDC, RedStone oracles, and Sonic Points for airdrop eligibility, Sonic Harvest offers a secure, scalable, and user-friendly solution for yield optimization.
 Table of Contents
 Overview (#overview)
@@ -454,7 +449,7 @@ Documentation: Update this README for new features or changes.
 License
 Sonic Harvest is licensed under the MIT License (LICENSE). See the LICENSE file for details.
 Contact
-Project Maintainer: [Your Name/Organization]
+Project Maintainer: Emantest/Sonic Harvest
 
 Email: support@sonic-harvest.io
 
