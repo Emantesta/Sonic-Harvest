@@ -27,20 +27,20 @@ License (#license)
 
 Contact (#contact)
 
-**Overview**
+**Overview**:
 Sonic Harvest is a UUPS-upgradeable, ownable, pausable, and reentrancy-guarded smart contract that aggregates yield farming opportunities on the Sonic Blockchain. It supports:
 Dynamic Rebalancing: Allocates funds to protocols based on real-time APY data from Chainlink/RedStone oracles.
 
-**Leveraged Yield Farming*": Supports borrowing from Aave V3, Compound, and FlyingTulip with strict LTV (Loan-to-Value) and health factor checks.
+**Leveraged Yield Farming**: Supports borrowing from Aave V3, Compound, and FlyingTulip with strict LTV (Loan-to-Value) and health factor checks.
 
 **Governance**: Multi-sig or DAO-based governance with timelocks for upgrades, fee updates, and fund recovery.
 
-Sonic Ecosystem Integration: Uses Sonic’s native USDC, Fee Monetization, and Sonic Points for user incentives.
+**Sonic Ecosystem Integration**: Uses Sonic’s native USDC, Fee Monetization, and Sonic Points for user incentives.
 
-Safety Mechanisms: Emergency pause, circuit breakers for oracle failures, and user blacklisting for compliance.
+**Safety Mechanisms**: Emergency pause, circuit breakers for oracle failures, and user blacklisting for compliance.
 
 The contract is designed for Sonic’s Blaze testnet and is compatible with SonicVM (EVM-compatible). It aims to provide users with optimized returns while maintaining security and transparency.
-Features
+#Features
 Supported Protocols:
 Aave V3 (supply/withdraw, variable-rate borrowing).
 
