@@ -1,7 +1,8 @@
 Sonic Harvest is a decentralized finance (DeFi) yield farming aggregator optimized for the Sonic Blockchain. It maximizes yield by dynamically allocating funds across multiple protocols, including Aave V3, Compound, FlyingTulip, real-world asset (RWA) protocols, and Sonic-native DeFi protocols. Leveraging Sonic’s Fee Monetization, native USDC, RedStone oracles, and Sonic Points for airdrop eligibility, Sonic Harvest offers a secure, scalable, and user-friendly solution for yield optimization.
 
-#Table of Contents
--**Overview** (#overview)
+**Table of Contents**
+
+Overview (#overview)
 
 Features (#features)
 
@@ -444,6 +445,334 @@ Please adhere to:
 Code Style: Follow Solidity style guide (e.g., 4-space indentation, NatSpec comments).
 
 Testing: Include unit tests for new features.
+
+Governance.sol is a decentralized governance contract for the Sonic Harvest protocol, enabling community-driven decision-making through voting with Sonic Harvest’s voting escrow NFT (veNFT). It supports proposals, voting, timelock execution, emergency actions, and contract upgrades, with features like quadratic voting, dynamic thresholds, and optimized gas usage. The contract is built using OpenZeppelin’s upgradeable, pausable, and reentrancy-protected frameworks, ensuring security and flexibility.
+Features
+veNFT-Based Voting: Voting power is derived from veNFT tokens, representing locked Sonic tokens with weights based on lock duration and amount.
+
+Quadratic Voting: Optional quadratic voting reduces the influence of large holders by applying the square root to voting weights, promoting fairness.
+
+Proposal System: Users can propose governance actions (e.g., fee updates, protocol whitelisting) with customizable quorum, parent dependencies, and quadratic voting.
+
+Batch Operations: Supports batch proposal creation and voting to optimize gas costs.
+
+Template Proposals: Predefined templates for common actions (e.g., fee updates, emergency withdrawals) simplify proposal creation.
+
+Delegation: Users can delegate veNFT voting power to others, with efficient batch delegation and revocation.
+
+Governance Council: A council of elected members can propose and approve emergency actions (e.g., pausing, rebalancing) with veto mechanisms.
+
+Timelock and Veto: Proposals and upgrades are subject to a timelock delay, with community veto options for emergency actions and upgrades.
+
+Rewards: USDC rewards for voting and cleaning up expired proposals incentivize participation.
+
+Dynamic Thresholds: Proposal thresholds adjust based on total veNFT supply, ensuring scalability.
+
+Storage Cleanup: Expired proposals are cleaned to prevent storage bloat, with rewards for callers.
+
+Upgradability: Uses OpenZeppelin’s UUPS proxy pattern for secure upgrades with storage version checks.
+
+Pausability: Governance can pause non-critical operations during emergencies.
+
+Whitelisting: Only whitelisted targets (e.g., SonicHarvest) can be called by proposals, enhancing security.
+
+Prerequisites
+Solidity Version: ^0.8.20
+
+Dependencies:
+OpenZeppelin Contracts (@openzeppelin/contracts and @openzeppelin/contracts-upgradeable):
+UUPSUpgradeable
+
+PausableUpgradeable
+
+ReentrancyGuard
+
+Math
+
+IERC20
+
+Sonic Interfaces:
+IVeNFT: Voting escrow NFT contract for voting power.
+
+ISonicHarvest: Sonic Harvest contract for protocol actions.
+
+IRewardDistributor: Reward distribution contract for USDC rewards.
+
+Installation
+Install Dependencies:
+bash
+
+npm install @openzeppelin/contracts @openzeppelin/contracts-upgradeable
+
+Compile the Contract:
+Use Hardhat, Foundry, or another Solidity compiler:
+bash
+
+npx hardhat compile
+
+Deploy the Contract:
+Deploy using a proxy pattern (UUPS) with the initialize function. Example using Hardhat:
+javascript
+
+const Governance = await ethers.getContractFactory("Governance");
+const governance = await upgrades.deployProxy(Governance, [
+  veNFTAddress,
+  sonicHarvestAddress,
+  rewardDistributorAddress,
+  usdcTokenAddress,
+  councilMembers,
+  councilThreshold,
+  timelockDelay
+], { initializer: 'initialize' });
+await governance.deployed();
+
+Usage
+Initialization
+The contract must be initialized with:
+veNFT: Address of the veNFT contract.
+
+sonicHarvest: Address of the SonicHarvest contract.
+
+rewardDistributor: Address of the IRewardDistributor contract.
+
+usdcToken: Address of Sonic’s native USDC token (6 decimals).
+
+councilMembers: Array of initial governance council members.
+
+councilThreshold: Number of council approvals required for emergency actions.
+
+timelockDelay: Timelock duration for proposal execution (1–30 days).
+
+Example:
+solidity
+
+governance.initialize(
+  "0x...", // veNFT
+  "0x...", // sonicHarvest
+  "0x...", // rewardDistributor
+  "0x...", // usdcToken
+  ["0x...", "0x..."], // councilMembers
+  2, // councilThreshold
+  3 days // timelockDelay
+);
+
+Key Functions
+Proposal Creation
+propose: Create a single proposal with actions, description, custom quorum, parent proposal, quadratic voting flag, and dependency flag.
+solidity
+
+Action[] memory actions = new Action[](1);
+actions[0] = Action(address(sonicHarvest), abi.encodeCall(ISonicHarvest.rebalance, ()), 0, new uint256[](0));
+governance.propose(actions, "Rebalance protocol", 0, 0, true, false);
+
+proposeBatch: Create multiple proposals in one transaction for gas efficiency.
+
+proposeWithTemplate: Use predefined templates (e.g., FeeUpdate, ProtocolWhitelist) for common actions.
+solidity
+
+bytes memory params = abi.encode(100, 200); // newManagementFee, newPerformanceFee
+governance.proposeWithTemplate(ProposalTemplate.FeeUpdate, params, "Update fees", true);
+
+Voting
+vote: Vote on a proposal using a specific veNFT.
+solidity
+
+governance.vote(proposalId, tokenId, true); // Vote in favor
+
+voteAsDelegatee: Vote using delegated power with pagination.
+solidity
+
+governance.voteAsDelegatee(proposalId, true, 0, 100);
+
+voteBatch: Vote on multiple proposals in one transaction.
+solidity
+
+uint256[] memory proposalIds = new uint256[](2);
+uint256[] memory tokenIds = new uint256[](2);
+bool[] memory supports = new bool[](2);
+governance.voteBatch(proposalIds, tokenIds, supports, startIndices, maxNFTs);
+
+Delegation
+delegateNFTsBatch: Delegate multiple veNFTs to a delegatee.
+solidity
+
+uint256[] memory tokenIds = new uint256[](2);
+tokenIds[0] = 1;
+tokenIds[1] = 2;
+governance.delegateNFTsBatch(tokenIds, delegateeAddress);
+
+revokeNFTsBatch: Revoke delegation for multiple veNFTs.
+
+Execution
+queue: Queue a successful proposal for execution after voting.
+solidity
+
+governance.queue(proposalId);
+
+execute: Execute a queued proposal after the timelock.
+solidity
+
+governance.execute(proposalId);
+
+Emergency Actions
+proposeEmergencyAction: Council members propose emergency actions (e.g., pause, rebalance).
+solidity
+
+governance.proposeEmergencyAction(address(sonicHarvest), abi.encodeCall(ISonicHarvest.setEmergencyPause, (true)));
+
+approveEmergencyAction: Council members approve emergency actions.
+
+proposeEmergencyVeto: Community members propose a veto for emergency actions.
+
+executeEmergencyVeto: Execute a successful veto.
+
+Upgrades
+proposeUpgrade: Propose a contract upgrade with a new implementation and storage version.
+solidity
+
+governance.proposeUpgrade(newImplementation, 2);
+
+executeUpgrade: Execute the upgrade after the timelock.
+
+proposeUpgradeVeto: Propose a veto for an upgrade.
+
+executeUpgradeVeto: Execute a successful veto.
+
+Council Elections
+voteForCouncil: Vote for council candidates using veNFT or delegated power.
+solidity
+
+governance.voteForCouncil(candidateAddress, tokenId);
+
+resetCouncilElection: Reset election votes every 90 days.
+
+Cleanup
+cleanupExpiredProposal: Clean a single expired proposal.
+solidity
+
+governance.cleanupExpiredProposal(proposalId);
+
+cleanupExpiredProposals: Clean multiple expired proposals incrementally.
+
+Governance Parameters
+updateVotingPeriod, updateQuorum, updateProposalThreshold, etc.: Update governance settings (only callable by governance).
+solidity
+
+governance.updateVotingPeriod(5 days);
+
+Configuration
+Constants
+MIN_VOTING_PERIOD: 3 days
+
+MAX_VOTING_PERIOD: 14 days
+
+MIN_QUORUM: 20% (2000 basis points)
+
+MAX_QUORUM: 60% (6000 basis points)
+
+MIN_PROPOSAL_THRESHOLD_BPS: 0.05% (5 basis points)
+
+EMERGENCY_COOLDOWN: 2 days
+
+UPGRADE_TIMELOCK: 3 days
+
+COUNCIL_TERM_DURATION: 180 days
+
+ELECTION_CYCLE_DURATION: 90 days
+
+DEFAULT_PROPOSAL_DEPOSIT: 10 USDC
+
+DEFAULT_VOTING_REWARD: 1 USDC
+
+DEFAULT_CLEANUP_REWARD: 0.1 USDC
+
+Configurable Parameters
+votingPeriod: Duration of voting (3–14 days).
+
+timelockDelay: Delay before execution (1–30 days).
+
+vetoWindow: Time to propose vetoes (12 hours–7 days).
+
+quorumPercentage: Required voter turnout (20–60%).
+
+proposalThresholdBps: Minimum voting power to propose (default: 0.5%).
+
+proposalDeposit: USDC deposit for proposals (default: 10 USDC).
+
+votingReward: USDC reward for voting (default: 1 USDC).
+
+cleanupReward: USDC reward for cleanup (default: 0.1 USDC).
+
+maxNFTsPerCheck: Maximum veNFTs to process for delegated voting (default: 1000).
+
+Security Considerations
+Reentrancy Protection: Uses ReentrancyGuard to prevent reentrancy attacks.
+
+Pausability: Critical functions can be paused during emergencies.
+
+Whitelisted Targets: Only whitelisted contracts (e.g., SonicHarvest) can be called by proposals.
+
+Timelock: Delays execution to allow community review and vetoes.
+
+Quadratic Voting Cache: Optimizes gas for repeated calculations but requires cleanup to manage storage.
+
+Sybil Resistance: veNFT’s non-fungibility and locking discourage vote splitting.
+
+Council Oversight: Emergency actions require multiple council approvals, with community veto options.
+
+Upgrade Safety: UUPS proxy with storage version checks ensures compatibility.
+
+Events
+Key events for tracking governance activities:
+ProposalCreated: Emitted when a proposal is created.
+
+Voted: Emitted when a vote is cast.
+
+QuadraticVoteCast: Emitted for quadratic votes.
+
+ProposalExecuted, ProposalCanceled, ProposalExpired: Track proposal lifecycle.
+
+EmergencyActionProposed, EmergencyActionApproved, EmergencyActionExecuted: Track emergency actions.
+
+NFTDelegationSet, BatchDelegationSet: Track delegation changes.
+
+UpgradeProposed, UpgradeExecuted, UpgradeVetoed: Track contract upgrades.
+
+VotingRewardDistributed, CleanupRewardDistributed: Track rewards.
+
+Testing
+Run tests using Hardhat or Foundry. Example test suite:
+javascript
+
+describe("Governance", function () {
+  it("should allow proposal creation and voting", async function () {
+    // Deploy and initialize contract
+    // Create proposal
+    // Vote with veNFT
+    // Queue and execute
+    // Verify state changes
+  });
+});
+
+Deployment
+Deploy veNFT, SonicHarvest, RewardDistributor, and USDC contracts.
+
+Deploy Governance.sol as a UUPS proxy with the initialize function.
+
+Whitelist SonicHarvest as a target.
+
+Configure initial council and parameters.
+
+Future Improvements
+Advanced Voting Modes: Add more voting mechanisms (e.g., ranked-choice voting).
+
+Gas Optimization: Further reduce gas costs for batch operations.
+
+UI Integration: Develop a user-friendly interface for proposal creation and voting.
+
+Cross-Chain Governance: Enable voting across multiple chains.
+
+Dynamic Rewards: Adjust rewards based on participation or proposal complexity.
 
 Documentation: Update this README for new features or changes.
 
