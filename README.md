@@ -40,8 +40,8 @@ Dynamic Rebalancing: Allocates funds to protocols based on real-time APY data fr
 **Safety Mechanisms**: Emergency pause, circuit breakers for oracle failures, and user blacklisting for compliance.
 
 The contract is designed for Sonic’s Blaze testnet and is compatible with SonicVM (EVM-compatible). It aims to provide users with optimized returns while maintaining security and transparency.
-#Features
-Supported Protocols:
+### Features
+**Supported Protocols**:
 Aave V3 (supply/withdraw, variable-rate borrowing).
 
 Compound (mint/redeem, borrowing with collateral factor checks).
@@ -52,26 +52,26 @@ RWA protocols (e.g., Sigma Fund for tokenized assets).
 
 Sonic-native DeFi protocols (via IDeFiYield interface).
 
-Yield Optimization:
+**Yield Optimization**:
 Reallocates funds to protocols with the highest APY, weighted by available liquidity.
 
 Fetches APY data from Chainlink/RedStone oracles, Aave/Compound APIs, or Sonic protocol interfaces.
 
-Leverage Management:
+**Leverage Management**:
 Supports up to 80% LTV for leveraged positions.
 
 Ensures Aave health factor ≥ 1.5 and Compound collateral factor ≥ 1.5e18.
 
 Unwinds leverage during emergency pauses.
 
-Fee Structure:
+**Fee Structure**:
 0.5% management fee on deposits.
 
 10% performance fee on profits.
 
 90% of gas fees contribute to Sonic Fee Monetization rewards.
 
-Governance and Security:
+**Governance and Security**:
 2-day timelock for upgrades, fee changes, and fund recovery.
 
 Emergency pause (7-day max) with user withdrawal support.
@@ -80,7 +80,7 @@ Circuit breaker pauses rebalancing if >50% of oracle feeds fail.
 
 Blacklist and OFAC compliance via FlyingTulip.
 
-User Incentives:
+**User Incentives**:
 Earn Sonic Points (2x for deposits/allocations, 1x for withdrawals) for airdrop eligibility.
 
 Claimable Fee Monetization rewards for governance.
