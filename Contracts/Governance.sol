@@ -39,6 +39,8 @@ interface ISonicHarvest {
 // Interface for RewardDistributor
 interface IRewardDistributor {
     function distributeVotingReward(address voter, uint256 amount) external;
+    function distributeBatchRewards(address[] calldata recipients, uint256[] calldata amounts) external;
+    function distributeDynamicReward(address recipient, uint256 tokenId, uint256 proposalId) external;
     function balanceOf(address token) external view returns (uint256);
 }
 
@@ -55,14 +57,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     IVeNFT public immutable veNFT;
     ISonicHarvest public immutable sonicHarvest;
     IRewardDistributor public rewardDistributor;
-    IERC20 public usdcToken; // Sonic native USDC for deposits and rewards
-    uint256 public proposalThresholdBps; // Basis points (0.5% = 50 bps)
+    IERC20 public usdcToken;
+    uint256 public proposalThresholdBps;
     uint256 public votingPeriod;
     uint256 public timelockDelay;
-    uint256 public vetoWindow; // Configurable veto window
+    uint256 public vetoWindow;
     uint256 public quorumPercentage;
     uint256 public proposalCount;
-    uint256 public upgradeProposalCount; // Separate counter for upgrades
+    uint256 public upgradeProposalCount;
     uint256 public emergencyActionCount;
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(uint256 => bool)) public nftVoted;
@@ -70,7 +72,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     address[] public councilMembersList;
     uint256 public councilMembersCount;
     mapping(address => uint256) public councilElectionVotes;
-    mapping(address => uint256) public councilTermEnd; // Term limits for council members
+    mapping(address => uint256) public councilTermEnd;
     uint256 public councilApprovalThreshold;
     mapping(uint256 => mapping(address => bool)) public councilApprovals;
     uint256 public lastEmergencyAction;
@@ -81,23 +83,25 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     mapping(uint256 => address) public nftDelegations;
     mapping(address => mapping(uint256 => bool)) public delegateeNFTs;
     mapping(address => uint256) public delegatedPower;
-    mapping(address => uint256) public proposalDeposits; // In USDC
+    mapping(address => uint256) public proposalDeposits;
     mapping(address => bool) public whitelistedTargets;
     mapping(uint256 => uint256) public vetoProposals;
     mapping(uint256 => uint256) public upgradeVetoProposals;
     mapping(uint256 => mapping(uint256 => address)) public nftDelegationHistory;
     mapping(address => uint256[]) public delegatedNFTs;
-    mapping(address => mapping(uint256 => uint256)) public delegatedNFTsIndex; // Index for efficient NFT removal
+    mapping(address => mapping(uint256 => uint256)) public delegatedNFTsIndex;
     mapping(uint256 => mapping(address => uint256)) public quadraticVotes;
-    mapping(uint256 => uint256) public quadraticWeightCache; // Cache for quadratic voting
+    mapping(uint256 => uint256) public quadraticWeightCache;
     uint256 public lastCleanupIndex;
-    uint256 public proposalDeposit; // Configurable deposit amount in USDC
-    uint256 public votingReward; // Configurable voting reward in USDC
-    uint256 public cleanupReward; // Reward for cleanup in USDC
-    uint256 public maxNFTsPerCheck; // Configurable max NFTs to check
-    uint256 public councilElectionCycle; // Tracks election cycles
-    uint256 public lastElectionReset; // Timestamp of last election reset
-    uint256 public storageVersion; // For upgrade compatibility check
+    uint256 public proposalDeposit;
+    uint256 public votingReward;
+    uint256 public cleanupReward;
+    uint256 public maxNFTsPerCheck;
+    uint256 public councilElectionCycle;
+    uint256 public lastElectionReset;
+    uint256 public storageVersion;
+    uint256 public councilTermDuration;
+    mapping(uint256 => string) private panicCodes;
 
     // Constants
     uint256 public constant BASIS_POINTS = 10000;
@@ -120,8 +124,9 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     uint256 public constant MAX_COUNCIL_PAGE_SIZE = 50;
     uint256 public constant MIN_TIMELOCK = 1 days;
     uint256 public constant MAX_TIMELOCK = 30 days;
-    uint256 public constant COUNCIL_TERM_DURATION = 180 days; // 6-month term
-    uint256 public constant ELECTION_CYCLE_DURATION = 90 days; // 3-month election cycle
+    uint256 public constant MIN_COUNCIL_TERM_DURATION = 30 days;
+    uint256 public constant MAX_COUNCIL_TERM_DURATION = 365 days;
+    uint256 public constant ELECTION_CYCLE_DURATION = 90 days;
     uint256 public constant DEFAULT_PROPOSAL_DEPOSIT = 10 * 1e6; // 10 USDC (6 decimals)
     uint256 public constant DEFAULT_VOTING_REWARD = 1 * 1e6; // 1 USDC
     uint256 public constant DEFAULT_CLEANUP_REWARD = 0.1 * 1e6; // 0.1 USDC
@@ -142,7 +147,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         uint256 quorumPercentage;
         uint256 parentProposalId;
         bool isQuadratic;
-        bool hasDependencies; // Flag for interdependent actions
+        bool hasDependencies;
     }
 
     // Action struct
@@ -150,7 +155,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         address target;
         bytes data;
         uint256 value;
-        uint256[] dependencies; // Indices of dependent actions
+        uint256[] dependencies;
     }
 
     // Upgrade proposal struct
@@ -158,7 +163,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         address implementation;
         uint256 proposalTime;
         bool vetoed;
-        uint256 storageVersion; // For compatibility check
+        uint256 storageVersion;
     }
 
     // Proposal states
@@ -180,7 +185,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         RecoverFunds,
         EmergencyWithdraw,
         EmergencyTransfer,
-        ProtocolWhitelist
+        ProtocolWhitelist,
+        Generic
     }
 
     // Events
@@ -221,6 +227,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     event CleanupRewardDistributed(address indexed caller, uint256 amount);
     event BatchDelegationSet(address indexed delegator, uint256[] tokenIds, address indexed delegatee);
     event BatchDelegationRevoked(address indexed delegator, uint256[] tokenIds);
+    event BatchRewardsDistributed(address[] recipients, uint256[] amounts);
+    event CouncilTermDurationUpdated(uint256 newDuration);
 
     // Modifiers
     modifier onlyCouncil() {
@@ -243,6 +251,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      * @param _councilMembers Array of initial governance council members.
      * @param _councilThreshold Number of council approvals required.
      * @param _timelockDelay Timelock delay for proposal execution.
+     * @param _councilTermDuration Duration of council member terms.
      */
     function initialize(
         address _veNFT,
@@ -251,7 +260,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         address _usdcToken,
         address[] calldata _councilMembers,
         uint256 _councilThreshold,
-        uint256 _timelockDelay
+        uint256 _timelockDelay,
+        uint256 _councilTermDuration
     ) external initializer {
         require(_veNFT != address(0), "Invalid veNFT address");
         require(_sonicHarvest != address(0), "Invalid SonicHarvest address");
@@ -260,6 +270,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         require(_councilMembers.length >= _councilThreshold && _councilThreshold >= MIN_COUNCIL_THRESHOLD, "Invalid council setup");
         require(_councilMembers.length > 0, "Empty council members");
         require(_timelockDelay >= MIN_TIMELOCK && _timelockDelay <= MAX_TIMELOCK, "Invalid timelock");
+        require(_councilTermDuration >= MIN_COUNCIL_TERM_DURATION && _councilTermDuration <= MAX_COUNCIL_TERM_DURATION, "Invalid term duration");
 
         __UUPSUpgradeable_init();
         __Pausable_init();
@@ -271,12 +282,22 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         usdcToken = IERC20(_usdcToken);
         whitelistedTargets[_sonicHarvest] = true;
 
+        // Initialize panic codes
+        panicCodes[0x01] = "Assertion failure";
+        panicCodes[0x11] = "Arithmetic overflow or underflow";
+        panicCodes[0x12] = "Division by zero";
+        panicCodes[0x21] = "Invalid enum value";
+        panicCodes[0x22] = "Storage write error";
+        panicCodes[0x31] = "Array access out of bounds";
+        panicCodes[0x32] = "Memory allocation overflow";
+        panicCodes[0x41] = "Zero-initialized variable";
+
         for (uint256 i = 0; i < _councilMembers.length; i++) {
             require(_councilMembers[i] != address(0), "Invalid council member");
             require(!governanceCouncil[_councilMembers[i]], "Duplicate council member");
             governanceCouncil[_councilMembers[i]] = true;
             councilMembersList.push(_councilMembers[i]);
-            councilTermEnd[_councilMembers[i]] = block.timestamp + COUNCIL_TERM_DURATION;
+            councilTermEnd[_councilMembers[i]] = block.timestamp + _councilTermDuration;
             emit CouncilMemberUpdated(_councilMembers[i], true, councilTermEnd[_councilMembers[i]]);
         }
         councilMembersCount = _councilMembers.length;
@@ -300,6 +321,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         councilElectionCycle = 1;
         lastElectionReset = block.timestamp;
         storageVersion = 1;
+        councilTermDuration = _councilTermDuration;
+        emit CouncilTermDurationUpdated(_councilTermDuration);
     }
 
     /**
@@ -365,8 +388,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      * @param actions Array of actions to execute (with dependencies).
      * @param description Proposal description.
      * @param customQuorum Custom quorum percentage (0 for default).
-     * @param parentProposalId ID of parent proposal (0 if none). Parent must be executed for this proposal to execute.
-     * @param isQuadratic Use quadratic voting for fairer vote distribution (square root of weight).
+     * @param parentProposalId ID of parent proposal (0 if none).
+     * @param isQuadratic Use quadratic voting.
      * @param hasDependencies True if actions depend on each other.
      * @return proposalId The ID of the created proposal.
      */
@@ -425,8 +448,6 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
     /**
      * @notice Proposes multiple governance actions in a batch.
-     * @dev All proposals share the proposer's voting power check for gas efficiency.
-     *      Each proposal can have its own actions, description, quorum, parent, and voting mode.
      * @param actions Array of action arrays (each with dependencies).
      * @param descriptions Array of descriptions.
      * @param customQuorums Array of custom quorums.
@@ -505,7 +526,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
     /**
      * @notice Proposes a governance action using a predefined template.
-     * @param template The proposal template type (e.g., FeeUpdate, ProtocolWhitelist).
+     * @param template The proposal template type.
      * @param params The parameters for the template.
      * @param description Proposal description.
      * @param isQuadratic Use quadratic voting.
@@ -518,7 +539,17 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         bool isQuadratic
     ) external nonReentrant whenNotPaused returns (uint256 proposalId) {
         Action[] memory actions = _generateTemplateActions(template, params);
-        return propose(actions, description, 0, 0, isQuadratic, template != ProposalTemplate.ProtocolWhitelist); // ProtocolWhitelist has no dependencies
+        bool hasDependencies = template != ProposalTemplate.ProtocolWhitelist;
+        if (template == ProposalTemplate.Generic) {
+            hasDependencies = false;
+            for (uint256 i = 0; i < actions.length; i++) {
+                if (actions[i].dependencies.length > 0) {
+                    hasDependencies = true;
+                    break;
+                }
+            }
+        }
+        return propose(actions, description, 0, 0, isQuadratic, hasDependencies);
     }
 
     /**
@@ -547,7 +578,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
         nftVoted[proposalId][tokenId] = true;
         quadraticVotes[proposalId][msg.sender] += adjustedWeight;
-        _distributeVotingReward(msg.sender);
+        _distributeDynamicVotingReward(msg.sender, tokenId, proposalId);
 
         emit Voted(proposalId, msg.sender, tokenId, support, adjustedWeight);
         if (proposal.isQuadratic) {
@@ -560,7 +591,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      * @param proposalId The proposal ID.
      * @param support True for in favor, false against.
      * @param startIndex Starting index for delegated NFTs.
-     * @param maxNFTs Maximum NFTs to process (capped by maxNFTsPerCheck).
+     * @param maxNFTs Maximum NFTs to process.
      */
     function voteAsDelegatee(uint256 proposalId, bool support, uint256 startIndex, uint256 maxNFTs) external nonReentrant whenNotPaused {
         require(_state(proposalId) == ProposalState.Active, "Voting not active");
@@ -578,7 +609,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         }
 
         quadraticVotes[proposalId][msg.sender] += adjustedWeight;
-        _distributeVotingReward(msg.sender);
+        _distributeDynamicVotingReward(msg.sender, 0, proposalId);
 
         emit Voted(proposalId, msg.sender, 0, support, adjustedWeight);
         if (proposal.isQuadratic) {
@@ -645,7 +676,24 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             }
         }
 
-        _distributeVotingReward(msg.sender);
+        _distributeDynamicVotingReward(msg.sender, tokenIds[0], proposalIds[0]);
+    }
+
+    /**
+     * @notice Distributes batch rewards to multiple recipients.
+     * @param recipients Array of recipient addresses.
+     * @param amounts Array of reward amounts.
+     */
+    function distributeBatchRewards(address[] calldata recipients, uint256[] calldata amounts) external onlyGovernance {
+        require(recipients.length == amounts.length, "Array length mismatch");
+        require(recipients.length > 0, "No recipients");
+        try rewardDistributor.distributeBatchRewards(recipients, amounts) {
+            emit BatchRewardsDistributed(recipients, amounts);
+        } catch Error(string memory reason) {
+            emit RewardDistributionFailed(address(0), 0, reason);
+        } catch {
+            emit RewardDistributionFailed(address(0), 0, "Unknown error");
+        }
     }
 
     /**
@@ -918,6 +966,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
         councilElectionVotes[candidate] += weight;
         emit CouncilElectionVote(msg.sender, candidate, weight);
+        _distributeDynamicVotingReward(msg.sender, tokenId, 0);
     }
 
     /**
@@ -1018,6 +1067,16 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     }
 
     /**
+     * @notice Updates the council term duration.
+     * @param newDuration The new term duration.
+     */
+    function updateCouncilTermDuration(uint256 newDuration) external onlyGovernance {
+        require(newDuration >= MIN_COUNCIL_TERM_DURATION && newDuration <= MAX_COUNCIL_TERM_DURATION, "Invalid term duration");
+        councilTermDuration = newDuration;
+        emit CouncilTermDurationUpdated(newDuration);
+    }
+
+    /**
      * @notice Updates a council member's status.
      * @param member The council member address.
      * @param status True to add, false to remove.
@@ -1028,7 +1087,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             governanceCouncil[member] = true;
             councilMembersList.push(member);
             councilMembersCount++;
-            councilTermEnd[member] = block.timestamp + COUNCIL_TERM_DURATION;
+            councilTermEnd[member] = block.timestamp + councilTermDuration;
             emit CouncilMemberUpdated(member, true, councilTermEnd[member]);
         } else if (!status && governanceCouncil[member]) {
             governanceCouncil[member] = false;
@@ -1120,7 +1179,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         require(proposalId <= proposalCount, "Invalid proposal ID");
         require(_state(proposalId) == ProposalState.Expired, "Not expired");
         _cleanupProposal(proposalId);
-        _distributeCleanupReward(msg.sender);
+        _distributeDynamicCleanupReward(msg.sender);
     }
 
     /**
@@ -1128,7 +1187,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      */
     function cleanupExpiredProposals() external nonReentrant {
         _cleanupExpiredProposals();
-        _distributeCleanupReward(msg.sender);
+        _distributeDynamicCleanupReward(msg.sender);
     }
 
     /**
@@ -1273,12 +1332,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     }
 
     /**
-     * @notice Distributes voting rewards in USDC.
+     * @notice Distributes dynamic voting rewards in USDC.
      * @param voter The voter address.
+     * @param tokenId The veNFT token ID.
+     * @param proposalId The proposal ID.
      */
-    function _distributeVotingReward(address voter) internal {
+    function _distributeDynamicVotingReward(address voter, uint256 tokenId, uint256 proposalId) internal {
         require(rewardDistributor.balanceOf(address(usdcToken)) >= votingReward, "Insufficient distributor balance");
-        try rewardDistributor.distributeVotingReward(voter, votingReward) {
+        try rewardDistributor.distributeDynamicReward(voter, tokenId, proposalId) {
             emit VotingRewardDistributed(voter, votingReward);
         } catch Error(string memory reason) {
             emit RewardDistributionFailed(voter, votingReward, reason);
@@ -1288,12 +1349,12 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     }
 
     /**
-     * @notice Distributes cleanup rewards in USDC.
+     * @notice Distributes dynamic cleanup rewards in USDC.
      * @param caller The caller address.
      */
-    function _distributeCleanupReward(address caller) internal {
+    function _distributeDynamicCleanupReward(address caller) internal {
         require(rewardDistributor.balanceOf(address(usdcToken)) >= cleanupReward, "Insufficient distributor balance");
-        try rewardDistributor.distributeVotingReward(caller, cleanupReward) {
+        try rewardDistributor.distributeDynamicReward(caller, 0, 0) {
             emit CleanupRewardDistributed(caller, cleanupReward);
         } catch Error(string memory reason) {
             emit RewardDistributionFailed(caller, cleanupReward, reason);
@@ -1342,7 +1403,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         for (uint256 i = 0; i < councilMembersCount; i++) {
             delete quadraticVotes[proposalId][councilMembersList[i]];
         }
-        uint256[] memory tokenIds = veNFT.tokensOfOwner(address(0)); // Dummy call to get possible token IDs
+        uint256[] memory tokenIds = veNFT.tokensOfOwner(address(0));
         for (uint256 i = 0; i < tokenIds.length && i < maxNFTsPerCheck; i++) {
             delete nftVoted[proposalId][tokenIds[i]];
         }
@@ -1356,13 +1417,35 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      * @param result The return data from the failed call.
      * @return The revert message.
      */
-    function _getRevertMsg(bytes memory result) internal pure returns (string memory) {
-        if (result.length < 68) return "Unknown error";
-        try this.decodeRevertMsg(result) returns (string memory reason) {
-            return reason;
-        } catch {
-            return "Custom error or invalid format";
+    function _getRevertMsg(bytes memory result) internal view returns (string memory) {
+        if (result.length == 0) {
+            return "Empty revert data";
         }
+
+        // Check for standard Error(string)
+        if (result.length >= 68 && bytes4(result) == bytes4(keccak256("Error(string)"))) {
+            try this.decodeRevertMsg(result) returns (string memory reason) {
+                return reason;
+            } catch {
+                return "Failed to decode Error(string)";
+            }
+        }
+
+        // Check for Panic(uint256)
+        if (result.length >= 68 && bytes4(result) == bytes4(keccak256("Panic(uint256)"))) {
+            try this.decodePanicMsg(result) returns (uint256 code) {
+                string memory reason = panicCodes[code];
+                if (bytes(reason).length > 0) {
+                    return string(abi.encodePacked("Panic: ", reason));
+                }
+                return string(abi.encodePacked("Panic: Unknown code 0x", _toHex(code)));
+            } catch {
+                return "Failed to decode Panic(uint256)";
+            }
+        }
+
+        // Handle custom errors or unknown formats
+        return string(abi.encodePacked("Custom error: 0x", _toHexString(result)));
     }
 
     /**
@@ -1372,6 +1455,15 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      */
     function decodeRevertMsg(bytes calldata result) external pure returns (string memory) {
         return abi.decode(result[4:], (string));
+    }
+
+    /**
+     * @notice Decodes panic code for external use.
+     * @param result The return data.
+     * @return The decoded panic code.
+     */
+    function decodePanicMsg(bytes calldata result) external pure returns (uint256) {
+        return abi.decode(result[4:], (uint256));
     }
 
     /**
@@ -1392,8 +1484,6 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
     /**
      * @notice Computes quadratic voting weight with caching.
-     * @dev Quadratic voting uses square root to reduce influence of large holders, increasing fairness but adding gas cost.
-     *      Cache reduces repeated Math.sqrt calls for same weight.
      * @param proposalId The proposal ID.
      * @param weight The raw voting weight.
      * @param isQuadratic True to apply quadratic voting.
@@ -1452,98 +1542,108 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      * @return actions The generated actions.
      */
     function _generateTemplateActions(ProposalTemplate template, bytes calldata params) internal view returns (Action[] memory actions) {
-        actions = new Action[](2);
-        if (template == ProposalTemplate.FeeUpdate) {
-            (uint256 newManagementFee, uint256 newPerformanceFee) = abi.decode(params, (uint256, uint256));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.proposeUpdateFees, (newManagementFee, newPerformanceFee)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.executeUpdateFees, (newManagementFee, newPerformanceFee)),
-                value: 0,
-                dependencies: new uint256[](1)
-            });
-            actions[1].dependencies[0] = 0;
-        } else if (template == ProposalTemplate.FeeRecipientUpdate) {
-            address newRecipient = abi.decode(params, (address));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.proposeFeeRecipientUpdate, (newRecipient)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.executeFeeRecipientUpdate, (newRecipient)),
-                value: 0,
-                dependencies: new uint256[](1)
-            });
-            actions[1].dependencies[0] = 0;
-        } else if (template == ProposalTemplate.RecoverFunds) {
-            (address protocol, uint256 amount) = abi.decode(params, (address, uint256));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.proposeRecoverFunds, (protocol, amount)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.executeRecoverFunds, (protocol, amount)),
-                value: 0,
-                dependencies: new uint256[](1)
-            });
-            actions[1].dependencies[0] = 0;
-        } else if (template == ProposalTemplate.EmergencyWithdraw) {
-            (address user, uint256 amount) = abi.decode(params, (address, uint256));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.proposeEmergencyWithdraw, (user, amount)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.executeEmergencyWithdraw, (user, amount)),
-                value: 0,
-                dependencies: new uint256[](1)
-            });
-            actions[1].dependencies[0] = 0;
-        } else if (template == ProposalTemplate.EmergencyTransfer) {
-            (address user, uint256 amount) = abi.decode(params, (address, uint256));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.proposeEmergencyTransfer, (user, amount)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.executeEmergencyTransfer, (user, amount)),
-                value: 0,
-                dependencies: new uint256[](1)
-            });
-            actions[1].dependencies[0] = 0;
-        } else if (template == ProposalTemplate.ProtocolWhitelist) {
-            (address protocol, bool status, address apyFeed, bool isCompound) = abi.decode(params, (address, bool, address, bool));
-            actions[0] = Action({
-                target: address(sonicHarvest),
-                data: abi.encodeCall(ISonicHarvest.setProtocolWhitelist, (protocol, status, apyFeed, isCompound)),
-                value: 0,
-                dependencies: new uint256[](0)
-            });
-            actions[1] = Action({
-                target: address(0),
-                data: "",
-                value: 0,
-                dependencies: new uint256[](0)
-            });
+        if (template == ProposalTemplate.Generic) {
+            actions = abi.decode(params, (Action[]));
+            require(actions.length > 0 && actions.length <= MAX_ACTIONS, "Invalid action count");
+            for (uint256 i = 0; i < actions.length; i++) {
+                require(whitelistedTargets[actions[i].target], "Invalid target");
+                require(actions[i].target != address(0), "Invalid target address");
+            }
+            _validateActionDependencies(actions);
         } else {
-            revert("Invalid template");
+            actions = new Action[](2);
+            if (template == ProposalTemplate.FeeUpdate) {
+                (uint256 newManagementFee, uint256 newPerformanceFee) = abi.decode(params, (uint256, uint256));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.proposeUpdateFees, (newManagementFee, newPerformanceFee)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.executeUpdateFees, (newManagementFee, newPerformanceFee)),
+                    value: 0,
+                    dependencies: new uint256[](1)
+                });
+                actions[1].dependencies[0] = 0;
+            } else if (template == ProposalTemplate.FeeRecipientUpdate) {
+                address newRecipient = abi.decode(params, (address));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.proposeFeeRecipientUpdate, (newRecipient)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.executeFeeRecipientUpdate, (newRecipient)),
+                    value: 0,
+                    dependencies: new uint256[](1)
+                });
+                actions[1].dependencies[0] = 0;
+            } else if (template == ProposalTemplate.RecoverFunds) {
+                (address protocol, uint256 amount) = abi.decode(params, (address, uint256));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.proposeRecoverFunds, (protocol, amount)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.executeRecoverFunds, (protocol, amount)),
+                    value: 0,
+                    dependencies: new uint256[](1)
+                });
+                actions[1].dependencies[0] = 0;
+            } else if (template == ProposalTemplate.EmergencyWithdraw) {
+                (address user, uint256 amount) = abi.decode(params, (address, uint256));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.proposeEmergencyWithdraw, (user, amount)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.executeEmergencyWithdraw, (user, amount)),
+                    value: 0,
+                    dependencies: new uint256[](1)
+                });
+                actions[1].dependencies[0] = 0;
+            } else if (template == ProposalTemplate.EmergencyTransfer) {
+                (address user, uint256 amount) = abi.decode(params, (address, uint256));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.proposeEmergencyTransfer, (user, amount)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.executeEmergencyTransfer, (user, amount)),
+                    value: 0,
+                    dependencies: new uint256[](1)
+                });
+                actions[1].dependencies[0] = 0;
+            } else if (template == ProposalTemplate.ProtocolWhitelist) {
+                (address protocol, bool status, address apyFeed, bool isCompound) = abi.decode(params, (address, bool, address, bool));
+                actions[0] = Action({
+                    target: address(sonicHarvest),
+                    data: abi.encodeCall(ISonicHarvest.setProtocolWhitelist, (protocol, status, apyFeed, isCompound)),
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+                actions[1] = Action({
+                    target: address(0),
+                    data: "",
+                    value: 0,
+                    dependencies: new uint256[](0)
+                });
+            } else {
+                revert("Invalid template");
+            }
         }
         return actions;
     }
@@ -1569,4 +1669,17 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         }
         return string(buffer);
     }
-}
+
+    /**
+     * @notice Converts uint256 to hex string.
+     * @param value The value to convert.
+     * @return The hex string representation.
+     */
+    function _toHex(uint256 value) internal pure returns (string memory) {
+        bytes16 hexSymbols = "0123456789abcdef";
+        bytes memory buffer = new bytes(64);
+        for (uint256 i = 31; i < 32ನ1.5.1.1; i--) {
+            buffer[i] = hexSymbols[value & 0xf];
+            value >>= 4;
+        }
+        return string
