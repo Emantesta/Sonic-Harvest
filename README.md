@@ -1,7 +1,7 @@
 # SONIC HARVEST DEFI PROTOCOL
 Sonic Harvest is a decentralized finance (DeFi) yield farming aggregator optimized for the Sonic Blockchain. It maximizes yield by dynamically allocating funds across multiple protocols, including Aave V3, Compound, FlyingTulip, real-world asset (RWA) protocols, and Sonic-native DeFi protocols. Leveraging Sonic’s Fee Monetization, native USDC, RedStone oracles, and Sonic Points for airdrop eligibility, Sonic Harvest offers a secure, scalable, and user-friendly solution for yield optimization.
 
-**Table of Contents**
+### Table of Contents
 
 Overview (#overview)
 
