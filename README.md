@@ -84,79 +84,76 @@ Blacklist and OFAC compliance via FlyingTulip.
 Earn Sonic Points (2x for deposits/allocations, 1x for withdrawals) for airdrop eligibility.
 
 Claimable Fee Monetization rewards for governance.
-
-Architecture
+### Architecture
 Sonic Harvest is built using Solidity 0.8.20 and follows a modular, upgradeable design:
 Key Components
-Interfaces:
-IAaveV3Pool: Interacts with Aave V3 for supply, withdrawal, and borrowing.
+#### Interfaces
+**IAaveV3Pool**: Interacts with Aave V3 for supply, withdrawal, and borrowing.
 
-ICompound: Manages Compound cToken minting, redemption, and borrowing.
+**ICompound**: Manages Compound cToken minting, redemption, and borrowing.
 
-IRWAYield: Handles RWA protocol deposits and withdrawals.
+**IRWAYield**: Handles RWA protocol deposits and withdrawals.
 
-IDeFiYield: Supports Sonic-native DeFi protocols.
+**IDeFiYield**: Supports Sonic-native DeFi protocols.
 
-IFlyingTulip: Provides dynamic APY, leverage, and compliance checks.
+**IFlyingTulip**: Provides dynamic APY, leverage, and compliance checks.
 
-ISonicProtocol: Ensures protocol compliance and fetches Sonic-native APYs.
+**ISonicProtocol**: Ensures protocol compliance and fetches Sonic-native APYs.
 
-State Variables:
-stablecoin: Sonic’s native USDC (immutable).
+#### State Variables:
+**stablecoin**: Sonic’s native USDC (immutable).
 
-allocations: Tracks protocol allocations (amount, APY, leverage status).
+**allocations**: Tracks protocol allocations (amount, APY, leverage status).
 
-userBalances: Records user deposits.
+**userBalances**: Records user deposits.
 
-sonicPointsEarned: Tracks user Sonic Points for airdrop.
+**sonicPointsEarned**: Tracks user Sonic Points for airdrop.
 
-totalFeeMonetizationRewards: Accumulates Fee Monetization rewards.
+**totalFeeMonetizationRewards**: Accumulates Fee Monetization rewards.
 
-Modifiers:
-onlyGovernance: Restricts sensitive functions to the governance address.
+#### Modifiers:
+**onlyGovernance**: Restricts sensitive functions to the governance address.
 
-whenNotEmergencyPaused: Prevents actions during emergency pauses.
+**whenNotEmergencyPaused**: Prevents actions during emergency pauses.
 
-sonicFeeMonetization: Calculates and accumulates Fee Monetization rewards.
+**sonicFeeMonetization**: Calculates and accumulates Fee Monetization rewards.
 
-Events:
+#### Events:
 Emits events for deposits, withdrawals, rebalancing, fee collection, governance updates, and more for transparency.
 
-Workflow
-Deposit: Users deposit USDC, pay a 0.5% management fee, and earn 2x Sonic Points. Funds are allocated to protocols based on APY.
+#### Workflow
+**Deposit**: Users deposit USDC, pay a 0.5% management fee, and earn 2x Sonic Points. Funds are allocated to protocols based on APY.
 
-Rebalance: Governance triggers rebalancing to optimize allocations using oracle data. Leveraged positions are adjusted if enabled.
+**Rebalance**: Governance triggers rebalancing to optimize allocations using oracle data. Leveraged positions are adjusted if enabled.
 
-Withdraw: Users withdraw funds, receive profits (minus 10% performance fee), and earn 1x Sonic Points.
+**Withdraw**: Users withdraw funds, receive profits (minus 10% performance fee), and earn 1x Sonic Points.
 
-Upkeep: Chainlink Automation updates APYs daily. Manual upkeep is available if automation fails.
+**Upkeep**: Chainlink Automation updates APYs daily. Manual upkeep is available if automation fails.
 
-Emergency: Governance can pause the contract, unwind leverage, or recover funds with a 2-day timelock.
+**Emergency**: Governance can pause the contract, unwind leverage, or recover funds with a 2-day timelock.
 
-Governance: Updates fees, governance, or whitelists protocols via timelocked actions.
+**Governance**: Updates fees, governance, or whitelists protocols via timelocked actions.
 
-Prerequisites
-Node.js: v16 or higher.
+### Prerequisites
+**Node.js**: v16 or higher.
 
-Hardhat or Foundry: For compilation, testing, and deployment.
+**Hardhat or Foundry**: For compilation, testing, and deployment.
 
-Sonic Blaze Testnet:
-RPC: https://rpc.testnet.sonic.network
+#### Sonic Blaze Testnet:
+**RPC**: https://rpc.testnet.sonic.network
+**Chain ID**: 64165
+**Native Token**: S
 
-Chain ID: 64165
-
-Native Token: S
-
-Dependencies:
+### Dependencies:
 OpenZeppelin Contracts (@openzeppelin/contracts-upgradeable@4.9.3).
 
 Chainlink Contracts (@chainlink/contracts@0.8).
 
-Wallet: MetaMask or compatible wallet with testnet S tokens and USDC.
+**Wallet**: MetaMask or compatible wallet with testnet S tokens and USDC.
 
-Faucet: Use Sonic’s testnet faucet to obtain S and USDC.
+**Faucet**: Use Sonic’s testnet faucet to obtain S and USDC.
 
-Installation
+#### Installation
 Clone the repository:
 bash
 
@@ -168,7 +165,7 @@ bash
 
 npm install
 
-Configure environment variables:
+**Configure environment variables**:
 Create a .env file:
 env
 
@@ -185,21 +182,21 @@ USDC_ADDRESS=0x...
 GOVERNANCE_ADDRESS=0x...
 FEE_RECIPIENT_ADDRESS=0x...
 
-Compile contracts:
+**Compile contracts**:
 bash
 
 npx hardhat compile
 
-Deployment
-Deploy dependency contracts (if not already deployed):
+### Deployment
+**Deploy dependency contracts (if not already deployed)**:
 Deploy mock or real implementations of Aave V3, Compound, FlyingTulip, RWAYield, DeFiYield, SonicProtocol, and SonicPointsToken.
 
-Deploy Sonic Harvest:
+**Deploy Sonic Harvest**:
 bash
 
 npx hardhat run scripts/deploy.js --network sonicTestnet
 
-Initialize the contract:
+**Initialize the contract**:
 Call initialize with the addresses from .env:
 javascript
 
@@ -216,7 +213,7 @@ await SonicHarvest.initialize(
   process.env.GOVERNANCE_ADDRESS
 );
 
-Verify the contract on Sonic’s testnet explorer:
+**Verify the contract on Sonic’s testnet explorer**:
 bash
 
 npx hardhat verify --network sonicTestnet <contractAddress> <constructorArgs>
@@ -230,24 +227,24 @@ javascript
 const usdc = await ethers.getContractAt("IERC20", process.env.USDC_ADDRESS);
 await usdc.approve(sonicHarvestAddress, ethers.utils.parseUnits("10000", 6)); // 10,000 USDC
 
-Deposit 10,000 USDC:
+**Deposit 10,000 USDC**:
 javascript
 
 await SonicHarvest.deposit(ethers.utils.parseUnits("10000", 6));
 
-Check Sonic Points earned:
+**Check Sonic Points earned**:
 javascript
 
 const points = await SonicHarvest.sonicPointsEarned(userAddress);
 console.log(`Earned Points: ${points.toString()}`);
 
-Withdraw Funds:
+**Withdraw Funds**:
 Withdraw 5,000 USDC:
 javascript
 
 await SonicHarvest.withdraw(ethers.utils.parseUnits("5000", 6));
 
-Claim Sonic Points:
+**Claim Sonic Points**:
 Claim points for airdrop eligibility:
 javascript
 
@@ -259,20 +256,20 @@ javascript
 
 await SonicHarvest.userEmergencyWithdraw(ethers.utils.parseUnits("5000", 6));
 
-For Governance
-Rebalance:
-Trigger rebalancing:
+#### For Governance
+**Rebalance**:
+**Trigger rebalancing**:
 javascript
 
 await SonicHarvest.rebalance();
 
-Toggle Leverage:
+**Toggle Leverage**:
 Enable/disable leverage:
 javascript
 
 await SonicHarvest.toggleLeverage(true); // Enable
 
-Update Fees:
+**Update Fees**:
 Propose and execute fee update:
 javascript
 
@@ -280,7 +277,7 @@ await SonicHarvest.proposeUpdateFees(100, 1500); // 1% management, 15% performan
 // Wait 2 days
 await SonicHarvest.executeUpdateFees(100, 1500);
 
-Recover Funds:
+**Recover Funds**:
 Propose and execute fund recovery:
 javascript
 
@@ -288,21 +285,21 @@ await SonicHarvest.proposeRecoverFunds(protocolAddress, ethers.utils.parseUnits(
 // Wait 2 days
 await SonicHarvest.executeRecoverFunds(protocolAddress, ethers.utils.parseUnits("1000", 6));
 
-Claim Fee Monetization Rewards:
+**Claim Fee Monetization Rewards**:
 Claim rewards:
 javascript
 
 await SonicHarvest.claimFeeMonetizationRewards();
 
-For Developers
-Whitelisting Protocols:
-Whitelist a new protocol:
+#### For Developers
+**Whitelisting Protocols**:
+**Whitelist a new protocol**:
 javascript
 
 await SonicHarvest.setProtocolWhitelist(newProtocolAddress, true, apyFeedAddress, isCompound);
 
-Manual Upkeep:
-Trigger manual upkeep:
+**Manual Upkeep**:
+**Trigger manual upkeep**:
 javascript
 
 await SonicHarvest.manualUpkeep();
