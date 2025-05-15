@@ -1,4 +1,4 @@
-PDX-License-Identifier: MIT
+a// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 // OpenZeppelin imports
@@ -95,10 +95,18 @@ interface ISonicProtocol {
     function getSonicAPY(address protocol) external view returns (uint256);
 }
 
+// AIYieldOptimizer interface
+interface IAIYieldOptimizer {
+    function submitAIAllocation(address[] calldata protocols, uint256[] calldata amounts, bool[] calldata isLeveraged) external;
+    function rebalancePortfolio(address[] calldata protocols, uint256[] calldata amounts, bool[] calldata isLeveraged) external;
+    function getSupportedProtocols() external view returns (address[] memory);
+    function getTotalRWABalance() external view returns (uint256);
+}
+
 /**
  * @title YieldOptimizer
  * @notice A DeFi yield farming aggregator optimized for Sonic Blockchain, supporting Aave V3, Compound, FlyingTulip, RWA, and Sonic-native protocols.
- * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, and Sonic Points for airdrop eligibility.
+ * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points for airdrop eligibility, and delegates RWA allocations to AIYieldOptimizer.
  */
 contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard, PausableUpgradeable, AutomationCompatibleInterface {
     using SafeERC20 for IERC20;
@@ -112,6 +120,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     IAaveV3Pool public immutable aavePool;
     ISonicProtocol public immutable sonicProtocol; // Sonic compliance and APY
     IERC20 public immutable sonicPointsToken; // Sonic Points for airdrop
+    IAIYieldOptimizer public immutable aiYieldOptimizer; // AIYieldOptimizer for RWA allocations
     address public governance; // Multi-sig or DAO
     address public feeRecipient; // Receives management/performance fees
     address public sonicNativeUSDC; // Sonic’s native USDC address
@@ -229,6 +238,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     event LeverageUnwound(address indexed protocol, uint256 repayAmount);
     event FeeMonetizationRewardsClaimed(uint256 amount);
     event SonicPointsClaimed(address indexed user, uint256 points);
+    event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -249,7 +259,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Initializes the contract with Sonic-specific parameters.
+     * @notice Initializes the contract with Sonic-specific parameters and AIYieldOptimizer.
      * @param _stablecoin Sonic’s native USDC address.
      * @param _rwaYield RWA yield contract.
      * @param _defiYield DeFi yield contract.
@@ -259,6 +269,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      * @param _sonicPointsToken Sonic Points token for airdrop.
      * @param _feeRecipient Fee recipient address.
      * @param _governance Governance address (multi-sig/DAO).
+     * @param _aiYieldOptimizer AIYieldOptimizer contract for RWA allocations.
      */
     function initialize(
         address _stablecoin,
@@ -269,7 +280,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         address _sonicProtocol,
         address _sonicPointsToken,
         address _feeRecipient,
-        address _governance
+        address _governance,
+        address _aiYieldOptimizer
     ) external initializer {
         require(!initializedImplementation, "Implementation already initialized");
         initializedImplementation = true;
@@ -283,6 +295,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         require(_sonicPointsToken != address(0), "Invalid SonicPointsToken address");
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_governance != address(0), "Invalid governance");
+        require(_aiYieldOptimizer != address(0), "Invalid AIYieldOptimizer address");
 
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
@@ -297,6 +310,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         aavePool = IAaveV3Pool(_aavePool);
         sonicProtocol = ISonicProtocol(_sonicProtocol);
         sonicPointsToken = IERC20(_sonicPointsToken);
+        aiYieldOptimizer = IAIYieldOptimizer(_aiYieldOptimizer);
         feeRecipient = _feeRecipient;
         governance = _governance;
         managementFee = 50; // 0.5%
@@ -401,9 +415,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Rebalances funds across protocols based on APY data.
+     * @notice Rebalances funds across protocols, delegating RWA allocations to AIYieldOptimizer.
      */
     function rebalance() external onlyGovernance nonReentrant whenNotPaused whenNotEmergencyPaused sonicFeeMonetization {
+        // Step 1: Withdraw from all protocols
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             Allocation storage alloc = allocations[protocol];
@@ -413,16 +428,24 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             }
         }
 
+        // Step 2: Clean up allocations
         _cleanAllocations();
 
+        // Step 3: Fetch APYs for non-RWA protocols
         (address[] memory protocols, uint256[] memory apys) = _getAPYsFromChainlink();
-        require(protocols.length > 0 && protocols.length <= MAX_PROTOCOLS, "Invalid protocol count");
+        require(protocols.length <= MAX_PROTOCOLS, "Invalid protocol count");
         require(protocols.length == apys.length, "APY data mismatch");
 
-        uint256 totalBalance = stablecoin.balanceOf(address(this));
+        // Step 4: Calculate total balance, including RWA balance from AIYieldOptimizer
+        uint256 totalBalance = stablecoin.balanceOf(address(this)) + aiYieldOptimizer.getTotalRWABalance();
         uint256 totalAPY = _totalAPY(apys);
 
+        // Step 5: Allocate to non-RWA protocols
+        uint256 nonRWAAmount = 0;
         for (uint256 i = 0; i < protocols.length; i++) {
+            if (rwaYield.isRWA(protocols[i])) {
+                continue; // Skip RWA protocols for now
+            }
             if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
                 emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
                 continue;
@@ -440,6 +463,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 isActiveProtocol[protocols[i]] = true;
             }
             _depositToProtocol(protocols[i], allocAmount, isLeveraged);
+            nonRWAAmount += allocAmount;
             if (isLeveraged) {
                 uint256 ltv;
                 if (protocols[i] == address(flyingTulip)) {
@@ -466,6 +490,20 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 }
             }
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
+        }
+
+        // Step 6: Delegate RWA allocation to AIYieldOptimizer
+        uint256 rwaAmount = totalBalance > nonRWAAmount ? totalBalance - nonRWAAmount : 0;
+        if (rwaAmount >= MIN_ALLOCATION) {
+            address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
+            uint256[] memory amounts = new uint256[](rwaProtocols.length);
+            bool[] memory isLeveraged = new bool[](rwaProtocols.length);
+            // AI model determines amounts and leverage off-chain, submitted via aiOracle
+            stablecoin.safeApprove(address(aiYieldOptimizer), 0);
+            stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
+            stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
+            aiYieldOptimizer.rebalancePortfolio(rwaProtocols, amounts, isLeveraged);
+            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
     }
 
@@ -994,7 +1032,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Allocates funds to protocols with Sonic points tracking.
+     * @notice Allocates funds to protocols, delegating RWA allocations to AIYieldOptimizer.
      */
     function _allocateFunds(uint256 amount, uint256 startIndex, uint256 endIndex) internal {
         require(endIndex <= activeProtocols.length && startIndex <= endIndex, "Invalid indices");
@@ -1007,7 +1045,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         require(protocols.length == apys.length, "APY data mismatch");
 
         uint256 totalAPY = _totalAPY(apys);
+        uint256 nonRWAAmount = 0;
+
+        // Step 1: Allocate to non-RWA protocols
         for (uint256 i = startIndex; i < endIndex && i < protocols.length; i++) {
+            if (rwaYield.isRWA(protocols[i])) {
+                continue; // Skip RWA protocols for now
+            }
             if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
                 emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
                 continue;
@@ -1025,6 +1069,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 isActiveProtocol[protocols[i]] = true;
             }
             _depositToProtocol(protocols[i], allocAmount, isLeveraged);
+            nonRWAAmount += allocAmount;
             sonicPointsEarned[msg.sender] += allocAmount * 2; // 2x points for allocation
             if (isLeveraged) {
                 uint256 ltv;
@@ -1052,6 +1097,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 }
             }
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
+        }
+
+        // Step 2: Delegate RWA allocation to AIYieldOptimizer
+        uint256 rwaAmount = amount > nonRWAAmount ? amount - nonRWAAmount : 0;
+        if (rwaAmount >= MIN_ALLOCATION) {
+            address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
+            uint256[] memory amounts = new uint256[](rwaProtocols.length);
+            bool[] memory isLeveraged = new bool[](rwaProtocols.length);
+            // AI model determines amounts and leverage off-chain, submitted via aiOracle
+            stablecoin.safeApprove(address(aiYieldOptimizer), 0);
+            stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
+            stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
+            aiYieldOptimizer.submitAIAllocation(rwaProtocols, amounts, isLeveraged);
+            sonicPointsEarned[msg.sender] += rwaAmount * 2; // 2x points for RWA allocation
+            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
     }
 
