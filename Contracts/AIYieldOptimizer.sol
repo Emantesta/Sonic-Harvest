@@ -626,6 +626,24 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         return supportedProtocols;
     }
 
+    function getRecommendedAllocations(uint256 totalAmount)
+    external
+    view
+    returns (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged)
+{
+    (address[] memory allProtocols, uint256[] memory apys) = getAllYields();
+    protocols = allProtocols;
+    amounts = new uint256[](allProtocols.length);
+    isLeveraged = new bool[](allProtocols.length);
+    uint256 totalAPY;
+    for (uint256 i = 0; i < allProtocols.length; i++) {
+        totalAPY = totalAPY.add(apys[i]);
+    }
+    for (uint256 i = 0; i < allProtocols.length; i++) {
+        amounts[i] = totalAPY > 0 ? (totalAmount * apys[i]) / totalAPY : 0;
+        isLeveraged[i] = allowLeverage && flyingTulip.getLTV(allProtocols[i], amounts[i]) <= MAX_LTV;
+    }
+
     /**
      * @dev Returns active allocations
      * @return Array of Allocation structs
@@ -638,3 +656,5 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         return result;
     }
 }
+
+    
