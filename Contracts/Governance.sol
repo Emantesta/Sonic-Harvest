@@ -18,8 +18,8 @@ interface IVeNFT {
     function tokensOfOwner(address owner) external view returns (uint256[] memory);
 }
 
-// Interface for SonicHarvest
-interface ISonicHarvest {
+// Interface for YieldOptimizer
+interface IYieldOptimize {
     function proposeUpdateFees(uint256 newManagementFee, uint256 newPerformanceFee) external;
     function executeUpdateFees(uint256 newManagementFee, uint256 newPerformanceFee) external;
     function proposeFeeRecipientUpdate(address newRecipient) external;
@@ -46,7 +46,7 @@ interface IRewardDistributor {
 
 /**
  * @title Governance
- * @notice Decentralized governance for Sonic Harvest using veNFT-based voting with per-NFT delegation.
+ * @notice Decentralized governance for YieldOptimizer using veNFT-based voting with per-NFT delegation.
  * @dev Manages proposals, voting, timelock execution, emergency actions, and upgrades. Enhanced with
  *      quadratic voting, dynamic thresholds, optimized gas usage, and configurable parameters.
  */
@@ -55,7 +55,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
     // State variables
     IVeNFT public immutable veNFT;
-    ISonicHarvest public immutable sonicHarvest;
+    IYieldOptimize public immutable yieldOptimizer;
     IRewardDistributor public rewardDistributor;
     IERC20 public usdcToken;
     uint256 public proposalThresholdBps;
@@ -87,7 +87,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     mapping(address => bool) public whitelistedTargets;
     mapping(uint256 => uint256) public vetoProposals;
     mapping(uint256 => uint256) public upgradeVetoProposals;
-    mapping(uint256 => mapping(uint256 => address)) public nftDelegationHistory;
+    mapping(uint256 => mapping(address => uint256)) public nftDelegationHistory;
     mapping(address => uint256[]) public delegatedNFTs;
     mapping(address => mapping(uint256 => uint256)) public delegatedNFTsIndex;
     mapping(uint256 => mapping(address => uint256)) public quadraticVotes;
@@ -245,7 +245,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     /**
      * @notice Initializes the governance contract.
      * @param _veNFT Address of the veNFT contract.
-     * @param _sonicHarvest Address of the SonicHarvest contract.
+     * @param _yieldOptimizer Address of the YieldOptimizer contract.
      * @param _rewardDistributor Address of the reward distributor contract.
      * @param _usdcToken Address of the Sonic native USDC token.
      * @param _councilMembers Array of initial governance council members.
@@ -255,7 +255,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      */
     function initialize(
         address _veNFT,
-        address _sonicHarvest,
+        address _yieldOptimizer,
         address _rewardDistributor,
         address _usdcToken,
         address[] calldata _councilMembers,
@@ -264,7 +264,7 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         uint256 _councilTermDuration
     ) external initializer {
         require(_veNFT != address(0), "Invalid veNFT address");
-        require(_sonicHarvest != address(0), "Invalid SonicHarvest address");
+        require(_yieldOptimizer != address(0), "Invalid YieldOptimizer address");
         require(_rewardDistributor != address(0), "Invalid reward distributor");
         require(_usdcToken != address(0), "Invalid USDC address");
         require(_councilMembers.length >= _councilThreshold && _councilThreshold >= MIN_COUNCIL_THRESHOLD, "Invalid council setup");
@@ -277,10 +277,10 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
         __ReentrancyGuard_init();
 
         veNFT = IVeNFT(_veNFT);
-        sonicHarvest = ISonicHarvest(_sonicHarvest);
+        yieldOptimizer = IYieldOptimize(_yieldOptimizer);
         rewardDistributor = IRewardDistributor(_rewardDistributor);
         usdcToken = IERC20(_usdcToken);
-        whitelistedTargets[_sonicHarvest] = true;
+        whitelistedTargets[_yieldOptimizer] = true;
 
         // Initialize panic codes
         panicCodes[0x01] = "Assertion failure";
@@ -767,13 +767,13 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
 
     /**
      * @notice Proposes an emergency action (e.g., pause, rebalance).
-     * @param target The target contract address (must be sonicHarvest).
+     * @param target The target contract address (must be yieldOptimizer).
      * @param data The calldata (must be a valid emergency function).
      * @return actionId The ID of the emergency action.
      */
     function proposeEmergencyAction(address target, bytes calldata data) external onlyCouncil nonReentrant returns (uint256 actionId) {
         require(block.timestamp >= lastEmergencyAction + EMERGENCY_COOLDOWN, "Cooldown not elapsed");
-        require(target == address(sonicHarvest), "Invalid target");
+        require(target == address(yieldOptimizer), "Invalid target");
         _validateEmergencyData(data);
 
         proposalCount++;
@@ -1318,13 +1318,13 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
      */
     function _validateEmergencyData(bytes calldata data) internal pure {
         bytes4 selector = bytes4(data);
-        if (selector == ISonicHarvest.setEmergencyPause.selector) {
+        if (selector == IYieldOptimize.setEmergencyPause.selector) {
             (bool status) = abi.decode(data[4:], (bool));
             require(status, "Only pause allowed");
-        } else if (selector == ISonicHarvest.toggleLeverage.selector) {
+        } else if (selector == IYieldOptimize.toggleLeverage.selector) {
             (bool status) = abi.decode(data[4:], (bool));
             require(status == true || status == false, "Invalid leverage status");
-        } else if (selector == ISonicHarvest.rebalance.selector) {
+        } else if (selector == IYieldOptimize.rebalance.selector) {
             require(data.length == 4, "Invalid rebalance parameters");
         } else {
             revert("Invalid emergency action");
@@ -1555,14 +1555,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             if (template == ProposalTemplate.FeeUpdate) {
                 (uint256 newManagementFee, uint256 newPerformanceFee) = abi.decode(params, (uint256, uint256));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.proposeUpdateFees, (newManagementFee, newPerformanceFee)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.proposeUpdateFees, (newManagementFee, newPerformanceFee)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
                 actions[1] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.executeUpdateFees, (newManagementFee, newPerformanceFee)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.executeUpdateFees, (newManagementFee, newPerformanceFee)),
                     value: 0,
                     dependencies: new uint256[](1)
                 });
@@ -1570,14 +1570,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             } else if (template == ProposalTemplate.FeeRecipientUpdate) {
                 address newRecipient = abi.decode(params, (address));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.proposeFeeRecipientUpdate, (newRecipient)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.proposeFeeRecipientUpdate, (newRecipient)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
                 actions[1] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.executeFeeRecipientUpdate, (newRecipient)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.executeFeeRecipientUpdate, (newRecipient)),
                     value: 0,
                     dependencies: new uint256[](1)
                 });
@@ -1585,14 +1585,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             } else if (template == ProposalTemplate.RecoverFunds) {
                 (address protocol, uint256 amount) = abi.decode(params, (address, uint256));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.proposeRecoverFunds, (protocol, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.proposeRecoverFunds, (protocol, amount)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
                 actions[1] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.executeRecoverFunds, (protocol, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.executeRecoverFunds, (protocol, amount)),
                     value: 0,
                     dependencies: new uint256[](1)
                 });
@@ -1600,14 +1600,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             } else if (template == ProposalTemplate.EmergencyWithdraw) {
                 (address user, uint256 amount) = abi.decode(params, (address, uint256));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.proposeEmergencyWithdraw, (user, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.proposeEmergencyWithdraw, (user, amount)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
                 actions[1] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.executeEmergencyWithdraw, (user, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.executeEmergencyWithdraw, (user, amount)),
                     value: 0,
                     dependencies: new uint256[](1)
                 });
@@ -1615,14 +1615,14 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             } else if (template == ProposalTemplate.EmergencyTransfer) {
                 (address user, uint256 amount) = abi.decode(params, (address, uint256));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.proposeEmergencyTransfer, (user, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.proposeEmergencyTransfer, (user, amount)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
                 actions[1] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.executeEmergencyTransfer, (user, amount)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.executeEmergencyTransfer, (user, amount)),
                     value: 0,
                     dependencies: new uint256[](1)
                 });
@@ -1630,8 +1630,8 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
             } else if (template == ProposalTemplate.ProtocolWhitelist) {
                 (address protocol, bool status, address apyFeed, bool isCompound) = abi.decode(params, (address, bool, address, bool));
                 actions[0] = Action({
-                    target: address(sonicHarvest),
-                    data: abi.encodeCall(ISonicHarvest.setProtocolWhitelist, (protocol, status, apyFeed, isCompound)),
+                    target: address(yieldOptimizer),
+                    data: abi.encodeCall(IYieldOptimize.setProtocolWhitelist, (protocol, status, apyFeed, isCompound)),
                     value: 0,
                     dependencies: new uint256[](0)
                 });
@@ -1678,8 +1678,25 @@ contract Governance is UUPSUpgradeable, PausableUpgradeable, ReentrancyGuard {
     function _toHex(uint256 value) internal pure returns (string memory) {
         bytes16 hexSymbols = "0123456789abcdef";
         bytes memory buffer = new bytes(64);
-        for (uint256 i = 31; i < 32ನ1.5.1.1; i--) {
+        for (uint256 i = 31; i < 32; i--) {
             buffer[i] = hexSymbols[value & 0xf];
             value >>= 4;
         }
-        return string
+        return string(buffer);
+    }
+
+    /**
+     * @notice Converts bytes to hex string.
+     * @param data The bytes to convert.
+     * @return The hex string representation.
+     */
+    function _toHexString(bytes memory data) internal pure returns (string memory) {
+        bytes16 hexSymbols = "0123456789abcdef";
+        bytes memory buffer = new bytes(2 * data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            buffer[2 * i] = hexSymbols[uint8(data[i] >> 4)];
+            buffer[2 * i + 1] = hexSymbols[uint8(data[i] & 0x0f)];
+        }
+        return string(buffer);
+    }
+}
