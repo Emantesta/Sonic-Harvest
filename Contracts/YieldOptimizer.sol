@@ -92,8 +92,10 @@ interface IFlyingTulip {
     function getAvailableLiquidity(address pool) external view returns (uint256);
 }
 
-// Sonic protocol interface
+// Interface for Sonic Protocol to handle Fee Monetization deposits
 interface ISonicProtocol {
+    // Deposits Sonic S tokens as Fee Monetization rewards
+    function depositFeeMonetizationRewards(address recipient, uint256 amount) external returns (bool);
     function isSonicCompliant(address protocol) external view returns (bool);
     function getSonicAPY(address protocol) external view returns (uint256);
 }
@@ -121,6 +123,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     using Math for uint256;
 
     // State variables
+    IERC20 public immutable sonicSToken; // Sonic S token for Fee Monetization rewards
     IERC20 public immutable stablecoin; // Sonic’s native USDC
     IRWAYield public immutable rwaYield;
     IDeFiYield public immutable defiYield;
@@ -168,11 +171,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     struct TimelockAction {
         bytes32 actionHash;
         uint256 timestamp;
+        bool executed;
     }
+    // Mappings for timelock actions
     mapping(bytes32 => TimelockAction) public timelockActions;
 
     // Constants
-    uint256 private constant BASIS_POINTS = 10000;
+    uint256 public constant BASIS_POINTS = 10000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
     uint256 private constant BLOCKS_PER_YEAR = 2628000; // ~13.5s per block, adjusted for Sonic
     uint256 private constant MAX_APY = 10000; // 100% max APY
@@ -189,7 +194,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     uint256 private constant MAX_PAUSE_DURATION = 7 days; // Emergency pause limit
     uint256 private constant GOVERNANCE_UPDATE_DELAY = 2 days; // Governance timelock
     uint256 private constant UPGRADE_DELAY = 2 days; // Upgrade timelock
-    uint256 private constant TIMELOCK_DELAY = 2 days; // Action timelock
+    uint256 public constant TIMELOCK_DELAY = 2 days; // Action timelock
 
     // Allocation struct
     struct Allocation {
@@ -244,6 +249,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     event CompoundSupplyFailed(address indexed protocol, uint256 amount, string reason);
     event CompoundWithdrawFailed(address indexed protocol, uint256 amount, string reason);
     event LeverageUnwound(address indexed protocol, uint256 repayAmount);
+    event FeeMonetizationRewardsDeposited(address indexed sender, uint256 amount);
+    event SonicSTokenUpdated(address indexed oldToken, address indexed newToken);
+    event SonicProtocolUpdated(address indexed oldProtocol, address indexed newProtocol);
     event FeeMonetizationRewardsClaimed(uint256 amount);
     event SonicPointsClaimed(address indexed user, uint256 points);
     event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
@@ -262,17 +270,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     modifier sonicFeeMonetization() {
         uint256 gasUsed = gasleft();
         _;
+        uint256 gasConsumed = gasUsed - gasleft();
         uint256 feeShare = ((gasUsed - gasleft()) * tx.gasprice * feeMonetizationShare) / 100;
         totalFeeMonetizationRewards += feeShare;
+        emit FeeMonetizationRewardsDeposited(address(this), feeShare);
     }
 
     /**
      * @notice Initializes the contract with Sonic-specific parameters and AIYieldOptimizer.
+     * @param _sonicSToken Address of the Sonic S token contract.
      * @param _stablecoin Sonic’s native USDC address.
      * @param _rwaYield RWA yield contract.
      * @param _defiYield DeFi yield contract.
      * @param _flyingTulip FlyingTulip contract.
      * @param _aavePool Aave V3 pool contract.
+     * @param _compound Compound protocol address.
      * @param _sonicProtocol Sonic protocol compliance contract.
      * @param _sonicPointsToken Sonic Points token for airdrop.
      * @param _feeRecipient Fee recipient address.
@@ -280,11 +292,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      * @param _aiYieldOptimizer AIYieldOptimizer contract for RWA allocations.
      */
     function initialize(
+        address _sonicSToken,
         address _stablecoin,
         address _rwaYield,
         address _defiYield,
         address _flyingTulip,
         address _aavePool,
+        address _compound,
         address _sonicProtocol,
         address _sonicPointsToken,
         address _feeRecipient,
@@ -295,10 +309,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         initializedImplementation = true;
 
         require(_stablecoin != address(0), "Invalid stablecoin address");
+        require(_sonicSToken != address(0), "Invalid Sonic S token address");
         require(_rwaYield != address(0), "Invalid RWAYield address");
         require(_defiYield != address(0), "Invalid DeFiYield address");
         require(_flyingTulip != address(0), "Invalid FlyingTulip address");
         require(_aavePool != address(0), "Invalid AavePool address");
+        require(_compound != address(0), "Invalid Compound address");
         require(_sonicProtocol != address(0), "Invalid SonicProtocol address");
         require(_sonicPointsToken != address(0), "Invalid SonicPointsToken address");
         require(_feeRecipient != address(0), "Invalid fee recipient");
@@ -310,11 +326,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         __Pausable_init();
         __ReentrancyGuard_init();
 
+        sonicSToken = IERC20(_sonicSToken);
         stablecoin = IERC20(_stablecoin);
         sonicNativeUSDC = _stablecoin;
         rwaYield = IRWAYield(_rwaYield);
         defiYield = IDeFiYield(_defiYield);
         flyingTulip = IFlyingTulip(_flyingTulip);
+        compound = ICompound(_compound);
         aavePool = IAaveV3Pool(_aavePool);
         sonicProtocol = ISonicProtocol(_sonicProtocol);
         sonicPointsToken = IERC20(_sonicPointsToken);
@@ -702,14 +720,106 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Claims Sonic Fee Monetization rewards for the developer.
+     * @notice Receives Fee Monetization rewards from Sonic Blockchain or ISonicProtocol.
+     * @param amount Amount of Sonic S tokens deposited.
      */
-    function claimFeeMonetizationRewards() external onlyGovernance nonReentrant sonicFeeMonetization {
+    function depositFeeMonetizationRewards(uint256 amount) external nonReentrant whenNotPaused {
+        require(amount > 0, "Invalid amount");
+        // Allow direct deposits or deposits via ISonicProtocol
+        if (msg.sender != address(sonicProtocol)) {
+            // Direct deposit: Transfer Sonic S tokens from sender
+            sonicSToken.safeTransferFrom(msg.sender, address(this), amount);
+        } else {
+            // ISonicProtocol deposit: Ensure protocol confirms transfer
+            require(sonicProtocol.depositFeeMonetizationRewards(address(this), amount), "Deposit failed");
+        }
+        totalFeeMonetizationRewards += amount;
+        emit FeeMonetizationRewardsDeposited(msg.sender, amount);
+    } 
+
+    /**
+     * @notice Claims accumulated Fee Monetization rewards in Sonic S tokens.
+     */
+    function claimFeeMonetizationRewards() external onlyGovernance nonReentrant sonicFeeMonetization whenNotPaused {
         uint256 rewards = totalFeeMonetizationRewards;
         require(rewards > 0, "No rewards available");
+        require(sonicSToken.balanceOf(address(this)) >= rewards, "Insufficient Sonic S balance");
+
         totalFeeMonetizationRewards = 0;
-        stablecoin.safeTransfer(governance, rewards);
-        emit FeeMonetizationRewardsClaimed(rewards);
+        sonicSToken.safeTransfer(governance, rewards);
+        emit FeeMonetizationRewardsClaimed(governance, rewards); 
+    }
+
+    /**
+     * @notice Proposes updating the Sonic S token address.
+     * @param newToken New Sonic S token address.
+     */
+    function proposeUpdateSonicSToken(address newToken) external onlyGovernance {
+        require(newToken != address(0), "Invalid token address");
+        bytes32 actionHash = keccak256(abi.encode("updateSonicSToken", newToken));
+        require(timelockActions[actionHash].timestamp == 0, "Action already proposed");
+
+        timelockActions[actionHash] = TimelockAction({
+            actionHash: actionHash,
+            timestamp: block.timestamp + TIMELOCK_DELAY,
+            executed: false
+        });
+        emit TimelockActionProposed(actionHash, timelockActions[actionHash].timestamp);
+    }
+
+    /**
+     * @notice Executes updating the Sonic S token address after timelock.
+     * @param newToken New Sonic S token address.
+     */
+    function executeUpdateSonicSToken(address newToken) external onlyGovernance nonReentrant {
+        require(newToken != address(0), "Invalid token address");
+        bytes32 actionHash = keccak256(abi.encode("updateSonicSToken", newToken));
+        TimelockAction storage action = timelockActions[actionHash];
+        require(action.timestamp != 0, "Action not proposed");
+        require(block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
+
+        address oldToken = address(sonicSToken);
+        sonicSToken = IERC20(newToken);
+        action.executed = true;
+        emit SonicSTokenUpdated(oldToken, newToken);
+        emit TimelockActionExecuted(actionHash, block.timestamp);
+    }
+
+    /**
+     * @notice Proposes updating the Sonic protocol address.
+     * @param newProtocol New Sonic protocol address.
+     */
+    function proposeUpdateSonicProtocol(address newProtocol) external onlyGovernance {
+        require(newProtocol != address(0), "Invalid protocol address");
+        bytes32 actionHash = keccak256(abi.encode("updateSonicProtocol", newProtocol));
+        require(timelockActions[actionHash].timestamp == 0, "Action already proposed");
+
+        timelockActions[actionHash] = TimelockAction({
+            actionHash: actionHash,
+            timestamp: block.timestamp + TIMELOCK_DELAY,
+            executed: false
+        });
+        emit TimelockActionProposed(actionHash, timelockActions[actionHash].timestamp);
+    }
+
+    /**
+     * @notice Executes updating the Sonic protocol address after timelock.
+     * @param newProtocol New Sonic protocol address.
+     */
+    function executeUpdateSonicProtocol(address newProtocol) external onlyGovernance nonReentrant {
+        require(newProtocol != address(0), "Invalid protocol address");
+        bytes32 actionHash = keccak256(abi.encode("updateSonicProtocol", newProtocol));
+        TimelockAction storage action = timelockActions[actionHash];
+        require(action.timestamp != 0, "Action not proposed");
+        require(block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
+
+        address oldProtocol = address(sonicProtocol);
+        sonicProtocol = ISonicProtocol(newProtocol);
+        action.executed = true;
+        emit SonicProtocolUpdated(oldProtocol, newProtocol);
+        emit TimelockActionExecuted(actionHash, block.timestamp);
     }
 
     /**
