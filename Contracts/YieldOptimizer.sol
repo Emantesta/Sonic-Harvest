@@ -1,4 +1,4 @@
-a// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 // OpenZeppelin imports
@@ -101,6 +101,11 @@ interface IAIYieldOptimizer {
     function rebalancePortfolio(address[] calldata protocols, uint256[] calldata amounts, bool[] calldata isLeveraged) external;
     function getSupportedProtocols() external view returns (address[] memory);
     function getTotalRWABalance() external view returns (uint256);
+    function getRecommendedAllocations(uint256 totalAmount)
+        external
+        view
+        returns (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged);
+    function withdrawForYieldOptimizer(address protocol, uint256 amount) external returns (uint256);
 }
 
 /**
@@ -418,33 +423,33 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      * @notice Rebalances funds across protocols, delegating RWA allocations to AIYieldOptimizer.
      */
     function rebalance() external onlyGovernance nonReentrant whenNotPaused whenNotEmergencyPaused sonicFeeMonetization {
-        // Step 1: Withdraw from all protocols
+        // Withdraw from non-RWA protocols
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             Allocation storage alloc = allocations[protocol];
-            if (alloc.amount > 0) {
+            if (alloc.amount > 0 && !rwaYield.isRWA(protocol)) {
                 uint256 withdrawn = _withdrawFromProtocol(protocol, alloc.amount);
                 alloc.amount -= withdrawn;
             }
         }
 
-        // Step 2: Clean up allocations
+        // Clean up allocations
         _cleanAllocations();
 
-        // Step 3: Fetch APYs for non-RWA protocols
+        // Fetch APYs
         (address[] memory protocols, uint256[] memory apys) = _getAPYsFromChainlink();
         require(protocols.length <= MAX_PROTOCOLS, "Invalid protocol count");
         require(protocols.length == apys.length, "APY data mismatch");
 
-        // Step 4: Calculate total balance, including RWA balance from AIYieldOptimizer
+        // Calculate total balance
         uint256 totalBalance = stablecoin.balanceOf(address(this)) + aiYieldOptimizer.getTotalRWABalance();
         uint256 totalAPY = _totalAPY(apys);
 
-        // Step 5: Allocate to non-RWA protocols
+        // Allocate to non-RWA protocols
         uint256 nonRWAAmount = 0;
         for (uint256 i = 0; i < protocols.length; i++) {
             if (rwaYield.isRWA(protocols[i])) {
-                continue; // Skip RWA protocols for now
+                continue;
             }
             if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
                 emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
@@ -492,13 +497,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
         }
 
-        // Step 6: Delegate RWA allocation to AIYieldOptimizer
+        // Delegate RWA reallocation
         uint256 rwaAmount = totalBalance > nonRWAAmount ? totalBalance - nonRWAAmount : 0;
         if (rwaAmount >= MIN_ALLOCATION) {
-            address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
-            uint256[] memory amounts = new uint256[](rwaProtocols.length);
-            bool[] memory isLeveraged = new bool[](rwaProtocols.length);
-            // AI model determines amounts and leverage off-chain, submitted via aiOracle
+            (address[] memory rwaProtocols, uint256[] memory amounts, bool[] memory isLeveraged) = aiYieldOptimizer.getRecommendedAllocations(rwaAmount);
             stablecoin.safeApprove(address(aiYieldOptimizer), 0);
             stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
@@ -633,13 +635,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             uint256 balance = stablecoin.balanceOf(address(this));
             if (balance < repayAmount) {
                 uint256 needed = repayAmount - balance;
-                try this.withdrawForRepayment(needed) {
-                    // Success
-                } catch {
-                    emit AllocationSkipped(protocol, "Failed to withdraw for repayment");
-                    _pauseLeverage(protocol);
-                    return;
-                }
+                _withdrawForRepayment(needed);
             }
             stablecoin.safeApprove(protocol, 0);
             stablecoin.safeApprove(protocol, repayAmount);
@@ -1047,10 +1043,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         uint256 totalAPY = _totalAPY(apys);
         uint256 nonRWAAmount = 0;
 
-        // Step 1: Allocate to non-RWA protocols
+        // Allocate to non-RWA protocols
         for (uint256 i = startIndex; i < endIndex && i < protocols.length; i++) {
             if (rwaYield.isRWA(protocols[i])) {
-                continue; // Skip RWA protocols for now
+                continue;
             }
             if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
                 emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
@@ -1070,7 +1066,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             }
             _depositToProtocol(protocols[i], allocAmount, isLeveraged);
             nonRWAAmount += allocAmount;
-            sonicPointsEarned[msg.sender] += allocAmount * 2; // 2x points for allocation
+            sonicPointsEarned[msg.sender] += allocAmount * 2;
             if (isLeveraged) {
                 uint256 ltv;
                 if (protocols[i] == address(flyingTulip)) {
@@ -1099,18 +1095,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
         }
 
-        // Step 2: Delegate RWA allocation to AIYieldOptimizer
+        // Delegate RWA allocation
         uint256 rwaAmount = amount > nonRWAAmount ? amount - nonRWAAmount : 0;
         if (rwaAmount >= MIN_ALLOCATION) {
-            address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
-            uint256[] memory amounts = new uint256[](rwaProtocols.length);
-            bool[] memory isLeveraged = new bool[](rwaProtocols.length);
-            // AI model determines amounts and leverage off-chain, submitted via aiOracle
+            (address[] memory rwaProtocols, uint256[] memory amounts, bool[] memory isLeveraged) = aiYieldOptimizer.getRecommendedAllocations(rwaAmount);
             stablecoin.safeApprove(address(aiYieldOptimizer), 0);
             stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
             aiYieldOptimizer.submitAIAllocation(rwaProtocols, amounts, isLeveraged);
-            sonicPointsEarned[msg.sender] += rwaAmount * 2; // 2x points for RWA allocation
+            sonicPointsEarned[msg.sender] += rwaAmount * 2;
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
     }
@@ -1122,10 +1115,35 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         require(endIndex <= activeProtocols.length && startIndex <= endIndex, "Invalid indices");
         uint256 totalWithdrawn = 0;
         address[] memory sortedProtocols = _sortProtocolsByLiquidity();
+        address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
+
+        // First, withdraw from RWA protocols via AIYieldOptimizer
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            uint256 rwaWithdrawAmount = (amount * rwaBalance) / (totalAllocated == 0 ? 1 : totalAllocated);
+            for (uint256 i = 0; i < rwaProtocols.length && totalWithdrawn < amount; i++) {
+                address protocol = rwaProtocols[i];
+                if (rwaWithdrawAmount > 0) {
+                    uint256 availableLiquidity = rwaYield.getAvailableLiquidity(protocol);
+                    uint256 withdrawAmount = rwaWithdrawAmount > availableLiquidity ? availableLiquidity : rwaWithdrawAmount;
+                    try aiYieldOptimizer.withdrawForYieldOptimizer(protocol, withdrawAmount) returns (uint256 withdrawn) {
+                        totalWithdrawn += withdrawn;
+                        sonicPointsEarned[msg.sender] += withdrawn; // 1x points for deallocation
+                    } catch {
+                        emit WithdrawalFailed(protocol, withdrawAmount);
+                    }
+                }
+            }
+        }
+
+        // Then, withdraw from non-RWA protocols
         for (uint256 i = startIndex; i < endIndex && totalWithdrawn < amount; i++) {
             address protocol = sortedProtocols[i];
+            if (rwaYield.isRWA(protocol)) {
+                continue; // Skip RWA protocols, already handled
+            }
             Allocation storage alloc = allocations[protocol];
-            uint256 withdrawAmount = (amount * alloc.amount) / totalAllocated;
+            uint256 withdrawAmount = (amount * alloc.amount) / (totalAllocated == 0 ? 1 : totalAllocated);
             if (withdrawAmount > 0) {
                 uint256 availableLiquidity = getProtocolLiquidity(protocol);
                 withdrawAmount = withdrawAmount > availableLiquidity ? availableLiquidity : withdrawAmount;
@@ -1211,8 +1229,31 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function _withdrawForRepayment(uint256 amount) internal nonReentrant {
         uint256 totalWithdrawn = 0;
         address[] memory sortedProtocols = _sortProtocolsByLiquidity();
+        address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
+
+        // First, withdraw from RWA protocols via AIYieldOptimizer
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            uint256 rwaWithdrawAmount = amount > rwaBalance ? rwaBalance : amount;
+            for (uint256 i = 0; i < rwaProtocols.length && totalWithdrawn < amount; i++) {
+                address protocol = rwaProtocols[i];
+                uint256 availableLiquidity = rwaYield.getAvailableLiquidity(protocol);
+                uint256 withdrawAmount = rwaWithdrawAmount > availableLiquidity ? availableLiquidity : rwaWithdrawAmount;
+                try aiYieldOptimizer.withdrawForYieldOptimizer(protocol, withdrawAmount) returns (uint256 withdrawn) {
+                    totalWithdrawn += withdrawn;
+                    emit FundsWithdrawnForRepayment(protocol, withdrawn);
+                } catch {
+                    emit WithdrawalFailed(protocol, withdrawAmount);
+                }
+            }
+        }
+
+        // Then, withdraw from non-RWA protocols
         for (uint256 i = 0; i < sortedProtocols.length && totalWithdrawn < amount; i++) {
             address protocol = sortedProtocols[i];
+            if (rwaYield.isRWA(protocol)) {
+                continue; // Skip RWA protocols, already handled
+            }
             Allocation storage alloc = allocations[protocol];
             uint256 availableLiquidity = getProtocolLiquidity(protocol);
             if (alloc.amount > 0 && availableLiquidity > 0) {
@@ -1523,62 +1564,169 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         return Math.exp(x, FIXED_POINT_SCALE);
     }
 
-    /**
+        /**
      * @notice Calculates user profit with protocol-specific compounding.
+     * @param user The user’s address.
+     * @param amount The amount being withdrawn.
+     * @return The calculated profit.
      */
     function _calculateProfit(address user, uint256 amount) internal view returns (uint256) {
-        uint256 userShare = totalAllocated == 0 ? 0 : (userBalances[user] * 1e18) / totalAllocated;
+        uint256 userShare = (userBalances[user] * FIXED_POINT_SCALE) / (totalAllocated == 0 ? 1 : totalAllocated);
         uint256 totalProfit = 0;
+
+        // Calculate profit from non-RWA protocols
+        for (uint256 i = 0; i < activeProtocols.length; i++) {
+            address protocol = activeProtocols[i];
+            Allocation memory alloc = allocations[protocol];
+            if (alloc.amount == 0 || rwaYield.isRWA(protocol)) {
+                continue;
+            }
+            uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
+            uint256 apy = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
+            if (apy == 0 || timeElapsed == 0) {
+                continue;
+            }
+            // Continuous compounding: profit = principal * (e^(APY * time) - 1)
+            uint256 rate = (apy * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
+            uint256 profit = (alloc.amount * userShare * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
+            totalProfit += profit;
+        }
+
+        // Include profit from RWA protocols via AIYieldOptimizer
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            // Assume AIYieldOptimizer provides an average APY for RWA allocations
+            uint256 rwaAPY = _getAverageRWAApy();
+            uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
+            if (rwaAPY > 0 && timeElapsed > 0) {
+                uint256 rate = (rwaAPY * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
+                uint256 rwaProfit = (rwaBalance * userShare * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
+                totalProfit += rwaProfit;
+            }
+        }
+
+        // Ensure profit is above minimum threshold
+        return totalProfit >= MIN_PROFIT ? totalProfit : 0;
+    }
+
+    /**
+     * @notice Gets the average APY for RWA protocols from AIYieldOptimizer.
+     * @return The average APY in basis points.
+     */
+    function _getAverageRWAApy() internal view returns (uint256) {
+        address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
+        uint256 totalAPY = 0;
+        uint256 validProtocols = 0;
+
+        for (uint256 i = 0; i < rwaProtocols.length; i++) {
+            uint256 apy = rwaYield.getRWAYield(rwaProtocols[i]);
+            if (apy > 0 && apy <= MAX_APY) {
+                totalAPY += apy;
+                validProtocols++;
+            }
+        }
+
+        return validProtocols > 0 ? totalAPY / validProtocols : 0;
+    }
+
+    /**
+     * @notice Gets the user’s current balance including profits.
+     * @param user The user’s address.
+     * @return The total balance including profits.
+     */
+    function getUserBalance(address user) external view returns (uint256) {
+        if (userBalances[user] == 0) {
+            return 0;
+        }
+        uint256 profit = _calculateProfit(user, userBalances[user]);
+        return userBalances[user] + profit;
+    }
+
+    /**
+     * @notice Gets the total value locked in the contract.
+     * @return The total value including non-RWA and RWA allocations.
+     */
+    function getTotalValueLocked() external view returns (uint256) {
+        uint256 total = totalAllocated;
+        for (uint256 i = 0; i < activeProtocols.length; i++) {
+            address protocol = activeProtocols[i];
+            if (!rwaYield.isRWA(protocol)) {
+                uint256 profit = _calculateProfitForProtocol(protocol);
+                total += profit;
+            }
+        }
+        // Include RWA profits
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            uint256 rwaAPY = _getAverageRWAApy();
+            uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
+            if (rwaAPY > 0 && timeElapsed > 0) {
+                uint256 rate = (rwaAPY * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
+                uint256 rwaProfit = (rwaBalance * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
+                total += rwaProfit;
+            }
+        }
+        return total;
+    }
+
+    /**
+     * @notice Calculates profit for a specific protocol.
+     * @param protocol The protocol address.
+     * @return The calculated profit.
+     */
+    function _calculateProfitForProtocol(address protocol) internal view returns (uint256) {
+        Allocation memory alloc = allocations[protocol];
+        if (alloc.amount == 0) {
+            return 0;
+        }
+        uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
+        uint256 apy = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
+        if (apy == 0 || timeElapsed == 0) {
+            return 0;
+        }
+        uint256 rate = (apy * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
+        uint256 profit = (alloc.amount * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
+        return profit >= MIN_PROFIT ? profit : 0;
+    }
+
+    /**
+     * @notice Gets the current allocations across all protocols.
+     * @return protocols The list of allocated protocols.
+     * @return amounts The amounts allocated to each protocol.
+     * @return apys The APYs for each protocol.
+     * @return isLeveraged Whether each allocation is leveraged.
+     */
+    function getCurrentAllocations()
+        external
+        view
+        returns (
+            address[] memory protocols,
+            uint256[] memory amounts,
+            uint256[] memory apys,
+            bool[] memory isLeveraged
+        )
+    {
+        protocols = new address[](activeProtocols.length);
+        amounts = new uint256[](activeProtocols.length);
+        apys = new uint256[](activeProtocols.length);
+        isLeveraged = new bool[](activeProtocols.length);
 
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             Allocation memory alloc = allocations[protocol];
-            uint256 yield = protocol == address(flyingTulip)
-                ? flyingTulip.getDynamicAPY(protocol)
-                : protocol == address(aavePool)
-                    ? _getAaveAPY(address(stablecoin))
-                    : isCompoundProtocol[protocol]
-                        ? _getCompoundAPY(protocol)
-                        : sonicProtocol.getSonicAPY(protocol);
-            uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
-            uint256 profit;
-            if (protocol == address(aavePool) || isCompoundProtocol[protocol]) {
-                profit = (alloc.amount * yield * timeElapsed) / (BASIS_POINTS * SECONDS_PER_YEAR);
-            } else {
-                uint256 rt = (yield * timeElapsed * FIXED_POINT_SCALE) / (BASIS_POINTS * SECONDS_PER_YEAR);
-                uint256 expRt = _exp(rt);
-                uint256 compounded = (alloc.amount * expRt) / FIXED_POINT_SCALE;
-                profit = compounded > alloc.amount ? compounded - alloc.amount : 0;
-            }
-            totalProfit += profit;
+            protocols[i] = protocol;
+            amounts[i] = alloc.amount;
+            apys[i] = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
+            isLeveraged[i] = alloc.isLeveraged;
         }
 
-        uint256 userProfit = (totalProfit * userShare * amount) / (1e18 * userBalances[user]);
-        return userProfit >= MIN_PROFIT ? userProfit : 0;
+        return (protocols, amounts, apys, isLeveraged);
     }
 
     /**
-     * @notice Estimates user profit.
+     * @notice Fallback function to prevent accidental ETH deposits.
      */
-    function estimateProfit(address user) external view returns (uint256) {
-        return _calculateProfit(user, userBalances[user]);
-    }
-
-    /**
-     * @notice Gets total value locked (TVL).
-     */
-    function getTVL() external view returns (uint256) {
-        return totalAllocated;
-    }
-
-    /**
-     * @notice Gets active allocations.
-     */
-    function getAllocations() external view returns (Allocation[] memory) {
-        Allocation[] memory result = new Allocation[](activeProtocols.length);
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            result[i] = allocations[activeProtocols[i]];
-        }
-        return result;
+    receive() external payable {
+        revert("Contract does not accept ETH");
     }
 }
