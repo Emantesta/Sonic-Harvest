@@ -92,9 +92,8 @@ interface IFlyingTulip {
     function getAvailableLiquidity(address pool) external view returns (uint256);
 }
 
-// Interface for Sonic Protocol to handle Fee Monetization deposits
+// Sonic Protocol interface
 interface ISonicProtocol {
-    // Deposits Sonic S tokens as Fee Monetization rewards
     function depositFeeMonetizationRewards(address recipient, uint256 amount) external returns (bool);
     function isSonicCompliant(address protocol) external view returns (bool);
     function getSonicAPY(address protocol) external view returns (uint256);
@@ -111,40 +110,44 @@ interface IAIYieldOptimizer {
         view
         returns (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged);
     function withdrawForYieldOptimizer(address protocol, uint256 amount) external returns (uint256);
+    // New: Expose AI allocation logic
+    function getAllocationLogic(uint256 totalAmount) external view returns (string memory logicDescription);
 }
 
 /**
  * @title YieldOptimizer
- * @notice A DeFi yield farming aggregator optimized for Sonic Blockchain, supporting Aave V3, Compound, FlyingTulip, RWA, and Sonic-native protocols.
- * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points for airdrop eligibility, and delegates RWA allocations to AIYieldOptimizer.
+ * @notice A DeFi yield farming aggregator optimized for Sonic Blockchain, supporting Aave V3, Compound, FlyingTulip, RWA, and Sonic-native protocols with AI-driven strategies.
+ * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points, and delegates RWA allocations to AIYieldOptimizer.
  */
 contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard, PausableUpgradeable, AutomationCompatibleInterface {
     using SafeERC20 for IERC20;
     using Math for uint256;
+    using PRBMathUD60x18 for uint256;
 
     // State variables
-    IERC20 public immutable sonicSToken; // Sonic S token for Fee Monetization rewards
-    IERC20 public immutable stablecoin; // Sonic’s native USDC
+    IERC20 public immutable sonicSToken;
+    IERC20 public immutable stablecoin;
     IRWAYield public immutable rwaYield;
     IDeFiYield public immutable defiYield;
     IFlyingTulip public immutable flyingTulip;
     IAaveV3Pool public immutable aavePool;
-    ISonicProtocol public immutable sonicProtocol; // Sonic compliance and APY
-    IERC20 public immutable sonicPointsToken; // Sonic Points for airdrop
-    IAIYieldOptimizer public immutable aiYieldOptimizer; // AIYieldOptimizer for RWA allocations
-    address public governance; // Multi-sig or DAO
-    address public feeRecipient; // Receives management/performance fees
-    address public sonicNativeUSDC; // Sonic’s native USDC address
-    uint256 public managementFee; // Basis points (e.g., 50 = 0.5%)
-    uint256 public performanceFee; // Basis points (e.g., 1000 = 10%)
-    uint256 public feeMonetizationShare; // Sonic FeeM share (default 90%)
-    uint256 public totalFeeMonetizationRewards; // Accumulated FeeM rewards
-    uint256 public totalAllocated; // Total funds allocated
-    uint256 public lastUpkeepTimestamp; // Last Chainlink upkeep
+    ICompound public immutable compound;
+    ISonicProtocol public immutable sonicProtocol;
+    IERC20 public immutable sonicPointsToken;
+    IAIYieldOptimizer public immutable aiYieldOptimizer;
+    address public governance;
+    address public feeRecipient;
+    address public sonicNativeUSDC;
+    uint256 public managementFee;
+    uint256 public performanceFee;
+    uint256 public feeMonetizationShare;
+    uint256 public totalFeeMonetizationRewards;
+    uint256 public totalAllocated;
+    uint256 public lastUpkeepTimestamp;
     uint256 public immutable MIN_DEPOSIT;
     uint256 public constant MAX_PROTOCOLS = 10;
-    uint256 public constant MAX_LTV = 8000; // 80% LTV cap
-    uint256 public constant MIN_ALLOCATION = 1e16; // 0.01 stablecoin units
+    uint256 public constant MAX_LTV = 8000; // 80%
+    uint256 public constant MIN_ALLOCATION = 1e16;
     bool public allowLeverage;
     bool public emergencyPaused;
     uint256 public pauseTimestamp;
@@ -153,56 +156,71 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     address public pendingImplementation;
     uint256 public upgradeTimestamp;
     bool private initializedImplementation;
+    uint256 public riskTolerance; // Basis points (e.g., 500 = 5% max loss)
+    // New: RWA liquidity threshold and volatility tracking
+    uint256 public minRWALiquidityThreshold; // Minimum liquidity for RWA protocols
+    uint256 public volatilityThreshold; // Basis points for leverage adjustment (e.g., 1000 = 10%)
+    AggregatorV3Interface public priceFeed; // Chainlink price feed for volatility
 
-    // Chainlink feeds and protocol data
-    mapping(address => AggregatorV3Interface) public protocolAPYFeeds; // Chainlink or RedStone feeds
-    mapping(address => uint256) public lastKnownAPYs; // Fallback APYs
-    mapping(address => bool) public whitelistedProtocols; // Allowed protocols
-    mapping(address => bool) public isCompoundProtocol; // Compound cTokens
-    mapping(address => uint256) public manualLiquidityOverrides; // Manual liquidity settings
-    mapping(address => bool) public blacklistedUsers; // Compliance blacklist
-    mapping(address => uint256) public sonicPointsEarned; // User airdrop points
-    mapping(address => Allocation) public allocations; // Protocol allocations
-    mapping(address => bool) public isActiveProtocol; // Active protocols
-    address[] public activeProtocols; // List of active protocols
-    mapping(address => uint256) public userBalances; // User deposits
+    // Mappings
+    mapping(address => AggregatorV3Interface) public protocolAPYFeeds;
+    mapping(address => uint256) public lastKnownAPYs;
+    mapping(address => bool) public whitelistedProtocols;
+    mapping(address => bool) public isCompoundProtocol;
+    mapping(address => uint256) public manualLiquidityOverrides;
+    mapping(address => bool) public blacklistedUsers;
+    mapping(address => uint256) public sonicPointsEarned;
+    mapping(address => Allocation) public allocations;
+    mapping(address => bool) public isActiveProtocol;
+    mapping(address => uint256) public protocolRiskScores; // AI-driven risk scores (0-10000)
+    mapping(address => uint256) public userBalances;
+    mapping(bytes32 => TimelockAction) public timelockActions;
 
-    // Governance timelock actions
+    address[] public activeProtocols;
+
+    // Constants
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 private constant SECONDS_PER_YEAR = 365 days;
+    uint256 private constant BLOCKS_PER_YEAR = 2628000;
+    uint256 private constant MAX_APY = 10000; // 100%
+    uint256 private constant FIXED_POINT_SCALE = 1e18;
+    uint256 private constant MAX_EXP_INPUT = 10e18;
+    uint256 private constant MIN_PROFIT = 1e6;
+    uint256 private constant AAVE_REFERRAL_CODE = 0;
+    uint256 private constant MAX_BORROW_AMOUNT = 1e24;
+    uint256 private constant MIN_HEALTH_FACTOR = 1.5e18;
+    uint256 private constant MIN_COLLATERAL_FACTOR = 1.5e18;
+    uint256 private constant MAX_STALENESS = 30 minutes;
+    uint256 private constant MAX_FEED_FAILURES = 50;
+    uint256 private constant UPKEEP_INTERVAL = 1 days;
+    uint256 private constant MAX_PAUSE_DURATION = 3 days; // Reduced from 7 days
+    uint256 private constant GOVERNANCE_UPDATE_DELAY = 2 days;
+    uint256 private constant UPGRADE_DELAY = 2 days;
+    uint256 public constant TIMELOCK_DELAY = 2 days;
+
+    // Structs
+    struct Allocation {
+        address protocol;
+        uint256 amount;
+        uint256 apy;
+        uint256 lastUpdated;
+        bool isLeveraged;
+    }
+
     struct TimelockAction {
         bytes32 actionHash;
         uint256 timestamp;
         bool executed;
     }
-    // Mappings for timelock actions
-    mapping(bytes32 => TimelockAction) public timelockActions;
 
-    // Constants
-    uint256 public constant BASIS_POINTS = 10000;
-    uint256 private constant SECONDS_PER_YEAR = 365 days;
-    uint256 private constant BLOCKS_PER_YEAR = 2628000; // ~13.5s per block, adjusted for Sonic
-    uint256 private constant MAX_APY = 10000; // 100% max APY
-    uint256 private constant FIXED_POINT_SCALE = 1e18;
-    uint256 private constant MAX_EXP_INPUT = 10e18; // Cap for _exp
-    uint256 private constant MIN_PROFIT = 1e6; // 0.000001 stablecoin
-    uint256 private constant AAVE_REFERRAL_CODE = 0;
-    uint256 private constant MAX_BORROW_AMOUNT = 1e24; // 1M stablecoin units
-    uint256 private constant MIN_HEALTH_FACTOR = 1.5e18; // Aave health factor
-    uint256 private constant MIN_COLLATERAL_FACTOR = 1.5e18; // Compound collateral factor
-    uint256 private constant MAX_STALENESS = 30 minutes; // Chainlink feed staleness
-    uint256 private constant MAX_FEED_FAILURES = 50; // 50% feed failure threshold
-    uint256 private constant UPKEEP_INTERVAL = 1 days; // Chainlink Automation interval
-    uint256 private constant MAX_PAUSE_DURATION = 7 days; // Emergency pause limit
-    uint256 private constant GOVERNANCE_UPDATE_DELAY = 2 days; // Governance timelock
-    uint256 private constant UPGRADE_DELAY = 2 days; // Upgrade timelock
-    uint256 public constant TIMELOCK_DELAY = 2 days; // Action timelock
-
-    // Allocation struct
-    struct Allocation {
+    // New: Struct for allocation breakdown
+    struct AllocationBreakdown {
         address protocol;
         uint256 amount;
-        uint256 apy; // Basis points
-        uint256 lastUpdated;
+        uint256 apy;
         bool isLeveraged;
+        uint256 liquidity;
+        uint256 riskScore;
     }
 
     // Events
@@ -252,9 +270,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     event FeeMonetizationRewardsDeposited(address indexed sender, uint256 amount);
     event SonicSTokenUpdated(address indexed oldToken, address indexed newToken);
     event SonicProtocolUpdated(address indexed oldProtocol, address indexed newProtocol);
-    event FeeMonetizationRewardsClaimed(uint256 amount);
+    event FeeMonetizationRewardsClaimed(address indexed recipient, uint256 amount);
     event SonicPointsClaimed(address indexed user, uint256 points);
     event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
+    event AIRiskAssessmentUpdated(address indexed protocol, uint256 riskScore);
+    event AIAllocationOptimized(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged);
+    // New: Event for AI allocation transparency
+    event AIAllocationDetails(address[] protocols, uint256[] amounts, bool[] isLeveraged, string logicDescription);
+    // New: Event for dynamic leverage adjustment
+    event LeverageAdjusted(address indexed protocol, uint256 newLTV, uint256 volatility);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -271,25 +295,14 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         uint256 gasUsed = gasleft();
         _;
         uint256 gasConsumed = gasUsed - gasleft();
-        uint256 feeShare = ((gasUsed - gasleft()) * tx.gasprice * feeMonetizationShare) / 100;
+        // New: Cap gas-based fees to prevent abuse
+        uint256 feeShare = Math.min(((gasConsumed * tx.gasprice * feeMonetizationShare) / 100), 1e18); // Cap at 1e18
         totalFeeMonetizationRewards += feeShare;
         emit FeeMonetizationRewardsDeposited(address(this), feeShare);
     }
 
     /**
-     * @notice Initializes the contract with Sonic-specific parameters and AIYieldOptimizer.
-     * @param _sonicSToken Address of the Sonic S token contract.
-     * @param _stablecoin Sonic’s native USDC address.
-     * @param _rwaYield RWA yield contract.
-     * @param _defiYield DeFi yield contract.
-     * @param _flyingTulip FlyingTulip contract.
-     * @param _aavePool Aave V3 pool contract.
-     * @param _compound Compound protocol address.
-     * @param _sonicProtocol Sonic protocol compliance contract.
-     * @param _sonicPointsToken Sonic Points token for airdrop.
-     * @param _feeRecipient Fee recipient address.
-     * @param _governance Governance address (multi-sig/DAO).
-     * @param _aiYieldOptimizer AIYieldOptimizer contract for RWA allocations.
+     * @notice Initializes the contract with Sonic-specific parameters and AI-driven settings.
      */
     function initialize(
         address _sonicSToken,
@@ -303,7 +316,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         address _sonicPointsToken,
         address _feeRecipient,
         address _governance,
-        address _aiYieldOptimizer
+        address _aiYieldOptimizer,
+        address _priceFeed // New: Chainlink price feed for volatility
     ) external initializer {
         require(!initializedImplementation, "Implementation already initialized");
         initializedImplementation = true;
@@ -320,6 +334,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_governance != address(0), "Invalid governance");
         require(_aiYieldOptimizer != address(0), "Invalid AIYieldOptimizer address");
+        require(_priceFeed != address(0), "Invalid price feed");
 
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
@@ -337,20 +352,23 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         sonicProtocol = ISonicProtocol(_sonicProtocol);
         sonicPointsToken = IERC20(_sonicPointsToken);
         aiYieldOptimizer = IAIYieldOptimizer(_aiYieldOptimizer);
+        priceFeed = AggregatorV3Interface(_priceFeed); // New: Initialize price feed
         feeRecipient = _feeRecipient;
         governance = _governance;
         managementFee = 50; // 0.5%
         performanceFee = 1000; // 10%
-        feeMonetizationShare = 90; // 90% for Sonic FeeM
+        feeMonetizationShare = 90; // 90%
         MIN_DEPOSIT = 10 ** IERC20Metadata(_stablecoin).decimals();
-        allowLeverage = false;
+        allowLeverage = true;
         emergencyPaused = false;
         lastUpkeepTimestamp = block.timestamp;
+        riskTolerance = 500; // 5% default risk tolerance
+        minRWALiquidityThreshold = 1e18; // New: Default 1e18 for RWA liquidity
+        volatilityThreshold = 1000; // New: 10% volatility threshold
     }
 
     /**
      * @notice Proposes a contract upgrade with a timelock.
-     * @param newImplementation Address of the new implementation.
      */
     function proposeUpgrade(address newImplementation) external onlyOwner {
         require(newImplementation != address(0), "Invalid implementation");
@@ -370,8 +388,41 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
+     * @notice Sets risk tolerance for AI-driven allocations.
+     */
+    function setRiskTolerance(uint256 _riskTolerance) external onlyGovernance sonicFeeMonetization {
+        require(_riskTolerance <= 1000, "Risk tolerance too high"); // Max 10%
+        riskTolerance = _riskTolerance;
+    }
+
+    /**
+     * @notice Updates protocol risk score based on AI assessment.
+     */
+    function updateProtocolRiskScore(address protocol, uint256 riskScore) external onlyGovernance sonicFeeMonetization {
+        require(riskScore <= 10000, "Invalid risk score");
+        protocolRiskScores[protocol] = riskScore;
+        emit AIRiskAssessmentUpdated(protocol, riskScore);
+    }
+
+    /**
+     * @notice Sets minimum liquidity threshold for RWA protocols.
+     */
+    function setMinRWALiquidityThreshold(uint256 _threshold) external onlyGovernance sonicFeeMonetization {
+        require(_threshold > 0, "Invalid threshold");
+        minRWALiquidityThreshold = _threshold;
+        emit LiquidityOverrideSet(address(0), _threshold);
+    }
+
+    /**
+     * @notice Sets volatility threshold for dynamic leverage adjustments.
+     */
+    function setVolatilityThreshold(uint256 _threshold) external onlyGovernance sonicFeeMonetization {
+        require(_threshold <= 5000, "Volatility threshold too high"); // Max 50%
+        volatilityThreshold = _threshold;
+    }
+
+    /**
      * @notice Deposits funds and allocates them to protocols with Sonic points tracking.
-     * @param amount Amount of stablecoin to deposit.
      */
     function deposit(uint256 amount) external nonReentrant whenNotPaused whenNotEmergencyPaused sonicFeeMonetization {
         require(amount >= MIN_DEPOSIT, "Deposit below minimum");
@@ -390,7 +441,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
         userBalances[msg.sender] += netAmount;
         totalAllocated += netAmount;
-        sonicPointsEarned[msg.sender] += netAmount * 2; // 2x multiplier for activity points
+        sonicPointsEarned[msg.sender] += netAmount * 2;
         _allocateFunds(netAmount, 0, activeProtocols.length);
 
         emit Deposit(msg.sender, netAmount, fee);
@@ -398,7 +449,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
     /**
      * @notice Withdraws funds and distributes profits.
-     * @param amount Amount to withdraw.
      */
     function withdraw(uint256 amount) external nonReentrant whenNotPaused whenNotEmergencyPaused sonicFeeMonetization {
         require(amount > 0, "Amount must be > 0");
@@ -410,7 +460,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
         userBalances[msg.sender] -= amount;
         totalAllocated -= amount;
-        sonicPointsEarned[msg.sender] += amount; // 1x points for withdrawals
+        sonicPointsEarned[msg.sender] += amount;
 
         uint256 withdrawnAmount = _deallocateFunds(amount, 0, activeProtocols.length);
         require(withdrawnAmount >= amount, "Insufficient funds withdrawn");
@@ -426,7 +476,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
     /**
      * @notice Allows users to withdraw funds during an emergency pause.
-     * @param amount Amount to withdraw.
      */
     function userEmergencyWithdraw(uint256 amount) external nonReentrant whenPaused {
         require(emergencyPaused, "Not emergency paused");
@@ -441,11 +490,14 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Rebalances funds across protocols, delegating RWA allocations to AIYieldOptimizer.
+     * @notice AI-driven rebalance with risk-adjusted allocations and Sonic compliance.
      */
     function rebalance() external onlyGovernance nonReentrant whenNotPaused whenNotEmergencyPaused sonicFeeMonetization {
+        // Gas Optimization: Cache activeProtocols length
+        uint256 protocolCount = activeProtocols.length;
+
         // Withdraw from non-RWA protocols
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
+        for (uint256 i = 0; i < protocolCount; i++) {
             address protocol = activeProtocols[i];
             Allocation storage alloc = allocations[protocol];
             if (alloc.amount > 0 && !rwaYield.isRWA(protocol)) {
@@ -453,35 +505,50 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 alloc.amount -= withdrawn;
             }
         }
-
-        // Clean up allocations
         _cleanAllocations();
 
-        // Fetch APYs
+        // Fetch APYs and risk scores
         (address[] memory protocols, uint256[] memory apys) = _getAPYsFromChainlink();
-        require(protocols.length <= MAX_PROTOCOLS, "Invalid protocol count");
+        require(protocols.length <= MAX_PROTOCOLS, "Too many protocols");
         require(protocols.length == apys.length, "APY data mismatch");
 
-        // Calculate total balance
         uint256 totalBalance = stablecoin.balanceOf(address(this)) + aiYieldOptimizer.getTotalRWABalance();
-        uint256 totalAPY = _totalAPY(apys);
+        uint256 totalWeightedAPY = 0;
+        uint256 nonRWAAmount = 0;
+
+        // Gas Optimization: Cache weights in memory
+        uint256[] memory weights = new uint256[](protocols.length);
+        for (uint256 i = 0; i < protocols.length; i++) {
+            if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
+                emit Allocation skipped(protocols[i], "Invalid protocol or APY");
+                continue;
+            }
+            // New: Stricter RWA validation
+            if (rwaYield.isRWA(protocols[i]) && !validateRWAProtocol(protocols[i])) {
+                emit AllocationSkipped(protocols[i], "RWA validation failed");
+                continue;
+            }
+            uint256 riskScore = protocolRiskScores[protocols[i]] > 0 ? protocolRiskScores[protocols[i]] : 5000;
+            uint256 riskAdjustedAPY = (apys[i] * (10000 - riskScore)) / 10000;
+            weights[i] = riskAdjustedAPY;
+            totalWeightedAPY += riskAdjustedAPY;
+        }
 
         // Allocate to non-RWA protocols
-        uint256 nonRWAAmount = 0;
         for (uint256 i = 0; i < protocols.length; i++) {
-            if (rwaYield.isRWA(protocols[i])) {
+            if (rwaYield.isRWA(protocols[i]) || weights[i] == 0) {
                 continue;
             }
-            if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
-                emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
-                continue;
-            }
-            uint256 allocAmount = (totalBalance * apys[i]) / totalAPY;
+            uint256 allocAmount = (totalBalance * weights[i]) / (totalWeightedAPY == 0 ? 1 : totalWeightedAPY);
             if (allocAmount < MIN_ALLOCATION) {
                 emit AllocationSkipped(protocols[i], "Amount below minimum");
                 continue;
             }
-            bool isLeveraged = allowLeverage && (protocols[i] == address(flyingTulip) || protocols[i] == address(aavePool) || isCompoundProtocol[protocols[i]]);
+            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[i], allocAmount);
+            // New: Dynamic leverage adjustment
+            if (isLeveraged) {
+                isLeveraged = adjustLeverageDynamically(protocols[i], allocAmount);
+            }
             allocations[protocols[i]] = Allocation(protocols[i], allocAmount, apys[i], block.timestamp, isLeveraged);
             lastKnownAPYs[protocols[i]] = apys[i];
             if (!isActiveProtocol[protocols[i]]) {
@@ -491,30 +558,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             _depositToProtocol(protocols[i], allocAmount, isLeveraged);
             nonRWAAmount += allocAmount;
             if (isLeveraged) {
-                uint256 ltv;
-                if (protocols[i] == address(flyingTulip)) {
-                    ltv = flyingTulip.getLTV(protocols[i], allocAmount);
-                } else if (protocols[i] == address(aavePool)) {
-                    ltv = aavePool.getUserAccountData(address(this)).ltv;
-                } else if (isCompoundProtocol[protocols[i]]) {
-                    (, uint256 collateralFactor, ) = ICompound(protocols[i]).getAccountLiquidity(address(this));
-                    ltv = (collateralFactor * BASIS_POINTS) / 1e18;
-                }
-                ltv = ltv > MAX_LTV ? MAX_LTV : ltv;
-                uint256 borrowAmount = (allocAmount * ltv) / BASIS_POINTS;
-                if (borrowAmount > 0 && borrowAmount <= MAX_BORROW_AMOUNT && _checkLiquidationRisk(protocols[i], allocAmount, borrowAmount)) {
-                    if (protocols[i] == address(flyingTulip)) {
-                        flyingTulip.borrowWithLTV(protocols[i], allocAmount, borrowAmount);
-                    } else if (protocols[i] == address(aavePool)) {
-                        _borrowFromAave(protocols[i], allocAmount, borrowAmount);
-                    } else if (isCompoundProtocol[protocols[i]]) {
-                        _borrowFromCompound(protocols[i], allocAmount, borrowAmount);
-                    }
-                    emit LTVBorrow(protocols[i], allocAmount, borrowAmount);
-                } else {
-                    emit AllocationSkipped(protocols[i], "Liquidation risk too high");
-                }
+                _applyLeverage(protocols[i], allocAmount);
             }
+            emit AIAllocationOptimized(protocols[i], allocAmount, apys[i], isLeveraged);
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
         }
 
@@ -522,12 +568,128 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         uint256 rwaAmount = totalBalance > nonRWAAmount ? totalBalance - nonRWAAmount : 0;
         if (rwaAmount >= MIN_ALLOCATION) {
             (address[] memory rwaProtocols, uint256[] memory amounts, bool[] memory isLeveraged) = aiYieldOptimizer.getRecommendedAllocations(rwaAmount);
+            // New: Validate AI allocations
+            require(validateAIAllocations(rwaProtocols, amounts, rwaAmount), "Invalid AI allocations");
             stablecoin.safeApprove(address(aiYieldOptimizer), 0);
             stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
             aiYieldOptimizer.rebalancePortfolio(rwaProtocols, amounts, isLeveraged);
+            // New: Emit AI allocation details
+            string memory logicDescription = aiYieldOptimizer.getAllocationLogic(rwaAmount);
+            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription);
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
+    }
+
+    /**
+     * @notice Validates AI-driven allocations to ensure correctness.
+     */
+    function validateAIAllocations(address[] memory protocols, uint256[] memory amounts, uint256 totalAmount) internal view returns (bool) {
+        if (protocols.length != amounts.length) return false;
+        uint256 sum = 0;
+        for (uint256 i = 0; i < protocols.length; i++) {
+            if (!rwaYield.isRWA(protocols[i]) || !validateRWAProtocol(protocols[i])) return false;
+            sum += amounts[i];
+        }
+        return sum <= totalAmount && sum >= totalAmount * 95 / 100; // Allow 5% tolerance
+    }
+
+    /**
+     * @notice Validates RWA protocol liquidity and vetting.
+     */
+    function validateRWAProtocol(address protocol) internal view returns (bool) {
+        return rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold &&
+               whitelistedProtocols[protocol] &&
+               sonicProtocol.isSonicCompliant(protocol);
+    }
+
+    /**
+     * @notice Assesses leverage viability based on AI-driven risk parameters and volatility.
+     */
+    function _assessLeverageViability(address protocol, uint256 amount) internal view returns (bool) {
+        uint256 riskScore = protocolRiskScores[protocol] > 0 ? protocolRiskScores[protocol] : 5000;
+        uint256 ltv = _getLTV(protocol, amount);
+        uint256 volatility = getMarketVolatility();
+        return riskScore < 7000 && // Max 70% risk score
+               ltv <= MAX_LTV &&
+               volatility <= volatilityThreshold &&
+               _checkLiquidationRisk(protocol, amount, (amount * ltv) / BASIS_POINTS);
+    }
+
+    /**
+     * @notice Dynamically adjusts leverage based on market volatility.
+     */
+    function adjustLeverageDynamically(address protocol, uint256 amount) internal returns (bool) {
+        uint256 volatility = getMarketVolatility();
+        uint256 ltv = _getLTV(protocol, amount);
+        if (volatility > volatilityThreshold) {
+            uint256 reducedLTV = ltv * (BASIS_POINTS - volatility) / BASIS_POINTS;
+            if (reducedLTV < ltv) {
+                uint256 repayAmount = (amount * (ltv - reducedLTV)) / BASIS_POINTS;
+                _withdrawForRepayment(repayAmount);
+                stablecoin.safeApprove(protocol, 0);
+                stablecoin.safeApprove(protocol, repayAmount);
+                if (protocol == address(flyingTulip)) {
+                    flyingTulip.repayBorrow(protocol, repayAmount);
+                } else if (protocol == address(aavePool)) {
+                    aavePool.repay(address(stablecoin), repayAmount, 2, address(this));
+                } else if (isCompoundProtocol[protocol]) {
+                    require(compound.repayBorrow(repayAmount) == 0, "Compound repay failed");
+                }
+                emit LeverageAdjusted(protocol, reducedLTV, volatility);
+                return reducedLTV > 0;
+            }
+        }
+        emit LeverageAdjusted(protocol, ltv, volatility);
+        return true;
+    }
+
+    /**
+     * @notice Calculates market volatility using Chainlink price feed.
+     */
+    function getMarketVolatility() public view returns (uint256) {
+        (, int256 price1, , uint256 updatedAt1, ) = priceFeed.latestRoundData();
+        (, int256 price2, , uint256 updatedAt2, ) = priceFeed.getRoundData(uint80(priceFeed.latestRound() - 1));
+        if (updatedAt1 <= updatedAt2 || price1 <= 0 || price2 <= 0) return volatilityThreshold;
+        uint256 timeDiff = updatedAt1 - updatedAt2;
+        uint256 priceDiff = price1 > price2 ? uint256(price1 - price2) : uint256(price2 - price1);
+        uint256 volatility = (priceDiff * BASIS_POINTS) / uint256(price1); // In basis points
+        return volatility;
+    }
+
+    /**
+     * @notice Applies leverage to a protocol.
+     */
+    function _applyLeverage(address protocol, uint256 amount) internal {
+        uint256 ltv = _getLTV(protocol, amount);
+        uint256 borrowAmount = (amount * ltv) / BASIS_POINTS;
+        if (borrowAmount > 0 && borrowAmount <= MAX_BORROW_AMOUNT && _checkLiquidationRisk(protocol, amount, borrowAmount)) {
+            if (protocol == address(flyingTulip)) {
+                flyingTulip.borrowWithLTV(protocol, amount, borrowAmount);
+            } else if (protocol == address(aavePool)) {
+                _borrowFromAave(protocol, amount, borrowAmount);
+            } else if (isCompoundProtocol[protocol]) {
+                _borrowFromCompound(protocol, amount, borrowAmount);
+            }
+            emit LTVBorrow(protocol, amount, borrowAmount);
+        } else {
+            emit AllocationSkipped(protocol, "Liquidation risk too high");
+        }
+    }
+
+    /**
+     * @notice Gets LTV for a protocol.
+     */
+    function _getLTV(address protocol, uint256 amount) internal view returns (uint256) {
+        if (protocol == address(flyingTulip)) {
+            return flyingTulip.getLTV(protocol, amount);
+        } else if (protocol == address(aavePool)) {
+            return aavePool.getUserAccountData(address(this)).ltv;
+        } else if (isCompoundProtocol[protocol]) {
+            (, uint256 collateralFactor, ) = compound.getAccountLiquidity(address(this));
+            return (collateralFactor * BASIS_POINTS) / 1e18;
+        }
+        return 0;
     }
 
     /**
@@ -540,7 +702,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         require(borrowAmount <= availableBorrowsBase, "Exceeds available borrow");
         stablecoin.safeApprove(protocol, 0);
         stablecoin.safeApprove(protocol, borrowAmount);
-        aavePool.borrow(address(stablecoin), borrowAmount, 2, AAVE_REFERRAL_CODE, address(this)); // Variable rate
+        aavePool.borrow(address(stablecoin), borrowAmount, 2, AAVE_REFERRAL_CODE, address(this));
     }
 
     /**
@@ -548,12 +710,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      */
     function _borrowFromCompound(address protocol, uint256 collateral, uint256 borrowAmount) internal {
         require(isCompoundProtocol[protocol], "Invalid protocol");
-        (, uint256 collateralFactor, uint256 liquidity) = ICompound(protocol).getAccountLiquidity(address(this));
+        (, uint256 collateralFactor, uint256 liquidity) = compound.getAccountLiquidity(address(this));
         require(collateralFactor >= MIN_COLLATERAL_FACTOR, "Collateral factor too low");
         require(borrowAmount <= liquidity, "Exceeds available liquidity");
         stablecoin.safeApprove(protocol, 0);
         stablecoin.safeApprove(protocol, borrowAmount);
-        require(ICompound(protocol).borrow(borrowAmount) == 0, "Compound borrow failed");
+        require(compound.borrow(borrowAmount) == 0, "Compound borrow failed");
     }
 
     /**
@@ -575,13 +737,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             _withdrawForRepayment(repayAmount);
             stablecoin.safeApprove(protocol, 0);
             stablecoin.safeApprove(protocol, repayAmount);
-            aavePool.repay(address(stablecoin), repayAmount, 2, address(this)); // Variable rate
+            aavePool.repay(address(stablecoin), repayAmount, 2, address(this));
         } else if (isCompoundProtocol[protocol]) {
-            repayAmount = ICompound(protocol).borrowBalanceCurrent(address(this));
+            repayAmount = compound.borrowBalanceCurrent(address(this));
             _withdrawForRepayment(repayAmount);
             stablecoin.safeApprove(protocol, 0);
             stablecoin.safeApprove(protocol, repayAmount);
-            require(ICompound(protocol).repayBorrow(repayAmount) == 0, "Compound repay failed");
+            require(compound.repayBorrow(repayAmount) == 0, "Compound repay failed");
         }
         alloc.isLeveraged = false;
         emit LeverageUnwound(protocol, repayAmount);
@@ -612,9 +774,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         if (isHealthy) {
             emit FeedHealthCheckPassed(validFeeds, totalFeeds);
         } else {
-            emit FeedHealthCheckFailed(validFeeds, totalFeeds);
+            emit FeedHealthCheckFailed(validFeeds, totalFeedsruleid: 135346
         }
-        return isHealthy;
+        emit FeedHealthCheckFailed(validFeeds, totalFeeds);
     }
 
     /**
@@ -641,15 +803,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function adjustLeverage(address protocol, uint256 maxLTV) external onlyGovernance nonReentrant sonicFeeMonetization {
         Allocation storage alloc = allocations[protocol];
         require(alloc.isLeveraged && (protocol == address(flyingTulip) || protocol == address(aavePool) || isCompoundProtocol[protocol]), "Invalid leveraged protocol");
-        uint256 currentLTV;
-        if (protocol == address(flyingTulip)) {
-            currentLTV = flyingTulip.getLTV(protocol, alloc.amount);
-        } else if (protocol == address(aavePool)) {
-            currentLTV = aavePool.getUserAccountData(address(this)).ltv;
-        } else if (isCompoundProtocol[protocol]) {
-            (, uint256 collateralFactor, ) = ICompound(protocol).getAccountLiquidity(address(this));
-            currentLTV = (collateralFactor * BASIS_POINTS) / 1e18;
-        }
+        uint256 currentLTV = _getLTV(protocol, alloc.amount);
         if (currentLTV > maxLTV) {
             uint256 excessLTV = currentLTV - maxLTV;
             uint256 repayAmount = (alloc.amount * excessLTV) / BASIS_POINTS;
@@ -663,9 +817,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             if (protocol == address(flyingTulip)) {
                 flyingTulip.repayBorrow(protocol, repayAmount);
             } else if (protocol == address(aavePool)) {
-                aavePool.repay(address(stablecoin), repayAmount, 2, address(this)); // Variable rate
+                aavePool.repay(address(stablecoin), repayAmount, 2, address(this));
             } else if (isCompoundProtocol[protocol]) {
-                require(ICompound(protocol).repayBorrow(repayAmount) == 0, "Compound repay failed");
+                require(compound.repayBorrow(repayAmount) == 0, "Compound repay failed");
             }
             emit LTVRepaid(protocol, repayAmount);
         }
@@ -711,6 +865,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             } else {
                 uint256 apy = sonicProtocol.getSonicAPY(protocol);
                 if (apy > 0 && apy <= MAX_APY) {
+                    lastKnownAPYs[protocol] = apy  {
                     lastKnownAPYs[protocol] = apy;
                     emit LastKnownAPYUpdated(protocol, apy);
                 }
@@ -721,21 +876,17 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
     /**
      * @notice Receives Fee Monetization rewards from Sonic Blockchain or ISonicProtocol.
-     * @param amount Amount of Sonic S tokens deposited.
      */
     function depositFeeMonetizationRewards(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Invalid amount");
-        // Allow direct deposits or deposits via ISonicProtocol
         if (msg.sender != address(sonicProtocol)) {
-            // Direct deposit: Transfer Sonic S tokens from sender
             sonicSToken.safeTransferFrom(msg.sender, address(this), amount);
         } else {
-            // ISonicProtocol deposit: Ensure protocol confirms transfer
             require(sonicProtocol.depositFeeMonetizationRewards(address(this), amount), "Deposit failed");
         }
         totalFeeMonetizationRewards += amount;
         emit FeeMonetizationRewardsDeposited(msg.sender, amount);
-    } 
+    }
 
     /**
      * @notice Claims accumulated Fee Monetization rewards in Sonic S tokens.
@@ -747,12 +898,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
         totalFeeMonetizationRewards = 0;
         sonicSToken.safeTransfer(governance, rewards);
-        emit FeeMonetizationRewardsClaimed(governance, rewards); 
+        emit FeeMonetizationRewardsClaimed(governance, rewards);
     }
 
     /**
      * @notice Proposes updating the Sonic S token address.
-     * @param newToken New Sonic S token address.
      */
     function proposeUpdateSonicSToken(address newToken) external onlyGovernance {
         require(newToken != address(0), "Invalid token address");
@@ -769,7 +919,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
     /**
      * @notice Executes updating the Sonic S token address after timelock.
-     * @param newToken New Sonic S token address.
      */
     function executeUpdateSonicSToken(address newToken) external onlyGovernance nonReentrant {
         require(newToken != address(0), "Invalid token address");
@@ -783,12 +932,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         sonicSToken = IERC20(newToken);
         action.executed = true;
         emit SonicSTokenUpdated(oldToken, newToken);
-        emit TimelockActionExecuted(actionHash, block.timestamp);
+        emit TimelockActionExecuted(actionHash);
     }
 
     /**
      * @notice Proposes updating the Sonic protocol address.
-     * @param newProtocol New Sonic protocol address.
      */
     function proposeUpdateSonicProtocol(address newProtocol) external onlyGovernance {
         require(newProtocol != address(0), "Invalid protocol address");
@@ -805,7 +953,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
 
     /**
      * @notice Executes updating the Sonic protocol address after timelock.
-     * @param newProtocol New Sonic protocol address.
      */
     function executeUpdateSonicProtocol(address newProtocol) external onlyGovernance nonReentrant {
         require(newProtocol != address(0), "Invalid protocol address");
@@ -819,7 +966,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         sonicProtocol = ISonicProtocol(newProtocol);
         action.executed = true;
         emit SonicProtocolUpdated(oldProtocol, newProtocol);
-        emit TimelockActionExecuted(actionHash, block.timestamp);
+        emit TimelockActionExecuted(actionHash);
     }
 
     /**
@@ -849,7 +996,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                     : protocol == address(aavePool)
                         ? IERC20(aavePool.getReserveData(address(stablecoin)).aTokenAddress).balanceOf(address(aavePool))
                         : isCompoundProtocol[protocol]
-                            ? IERC20(ICompound(protocol).underlying()).balanceOf(protocol)
+                            ? IERC20(compound.underlying()).balanceOf(protocol)
                             : defiYield.getAvailableLiquidity(protocol)
         returns (uint256 available) {
             return available;
@@ -899,9 +1046,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      * @notice Proposes updating management and performance fees.
      */
     function proposeUpdateFees(uint256 newManagementFee, uint256 newPerformanceFee) external onlyGovernance sonicFeeMonetization {
-        require(newManagementFee <= 200 && newPerformanceFee <= 2000, "Fees too high"); // Max 2% and 20%
+        require(newManagementFee <= 200 && newPerformanceFee <= 2000, "Fees too high");
         bytes32 actionHash = keccak256(abi.encode("updateFees", newManagementFee, newPerformanceFee));
-        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
+        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY, false);
         emit TimelockActionProposed(actionHash, block.timestamp + TIMELOCK_DELAY);
     }
 
@@ -912,9 +1059,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         bytes32 actionHash = keccak256(abi.encode("updateFees", newManagementFee, newPerformanceFee));
         TimelockAction memory action = timelockActions[actionHash];
         require(action.timestamp > 0 && block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
         managementFee = newManagementFee;
         performanceFee = newPerformanceFee;
-        delete timelockActions[actionHash];
+        timelockActions[actionHash].executed = true;
         emit FeesUpdated(newManagementFee, newPerformanceFee);
         emit TimelockActionExecuted(actionHash);
     }
@@ -925,7 +1073,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function proposeFeeRecipientUpdate(address newRecipient) external onlyGovernance sonicFeeMonetization {
         require(newRecipient != address(0), "Invalid address");
         bytes32 actionHash = keccak256(abi.encode("updateFeeRecipient", newRecipient));
-        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
+        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY, false);
         emit TimelockActionProposed(actionHash, block.timestamp + TIMELOCK_DELAY);
     }
 
@@ -933,8 +1081,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         bytes32 actionHash = keccak256(abi.encode("updateFeeRecipient", newRecipient));
         TimelockAction memory action = timelockActions[actionHash];
         require(action.timestamp > 0 && block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
         feeRecipient = newRecipient;
-        delete timelockActions[actionHash];
+        timelockActions[actionHash].executed = true;
         emit FeeRecipientUpdated(newRecipient);
         emit TimelockActionExecuted(actionHash);
     }
@@ -1003,7 +1152,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function proposeRecoverFunds(address protocol, uint256 amount) external onlyGovernance sonicFeeMonetization {
         require(amount > 0, "Amount must be > 0");
         bytes32 actionHash = keccak256(abi.encode("recoverFunds", protocol, amount));
-        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
+        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY, false);
         emit TimelockActionProposed(actionHash, block.timestamp + TIMELOCK_DELAY);
     }
 
@@ -1014,11 +1163,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         bytes32 actionHash = keccak256(abi.encode("recoverFunds", protocol, amount));
         TimelockAction memory action = timelockActions[actionHash];
         require(action.timestamp > 0 && block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
         uint256 withdrawn = _withdrawFromProtocol(protocol, amount);
         require(withdrawn > 0, "No funds recovered");
         allocations[protocol].amount -= withdrawn;
         _cleanAllocations();
-        delete timelockActions[actionHash];
+        timelockActions[actionHash].executed = true;
         emit FundsRecovered(protocol, withdrawn);
         emit TimelockActionExecuted(actionHash);
     }
@@ -1029,7 +1179,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function proposeEmergencyWithdraw(address user, uint256 amount) external onlyGovernance sonicFeeMonetization {
         require(userBalances[user] >= amount, "Insufficient balance");
         bytes32 actionHash = keccak256(abi.encode("emergencyWithdraw", user, amount));
-        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
+        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY, false);
         emit TimelockActionProposed(actionHash, block.timestamp + TIMELOCK_DELAY);
     }
 
@@ -1040,12 +1190,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         bytes32 actionHash = keccak256(abi.encode("emergencyWithdraw", user, amount));
         TimelockAction memory action = timelockActions[actionHash];
         require(action.timestamp > 0 && block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
         require(emergencyPaused, "Not emergency paused");
         require(userBalances[user] >= amount, "Insufficient balance");
         userBalances[user] -= amount;
         totalAllocated -= amount;
         stablecoin.safeTransfer(user, amount);
-        delete timelockActions[actionHash];
+        timelockActions[actionHash].executed = true;
         emit EmergencyTransfer(user, amount);
         emit TimelockActionExecuted(actionHash);
     }
@@ -1056,7 +1207,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     function proposeEmergencyTransfer(address user, uint256 amount) external onlyGovernance sonicFeeMonetization {
         require(stablecoin.balanceOf(address(this)) >= amount, "Insufficient balance");
         bytes32 actionHash = keccak256(abi.encode("emergencyTransfer", user, amount));
-        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
+        timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY, false);
         emit TimelockActionProposed(actionHash, block.timestamp + TIMELOCK_DELAY);
     }
 
@@ -1067,10 +1218,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         bytes32 actionHash = keccak256(abi.encode("emergencyTransfer", user, amount));
         TimelockAction memory action = timelockActions[actionHash];
         require(action.timestamp > 0 && block.timestamp >= action.timestamp, "Timelock not elapsed");
+        require(!action.executed, "Action already executed");
         require(emergencyPaused, "Not emergency paused");
         require(stablecoin.balanceOf(address(this)) >= amount, "Insufficient balance");
         stablecoin.safeTransfer(user, amount);
-        delete timelockActions[actionHash];
+        timelockActions[actionHash].executed = true;
         emit EmergencyTransfer(user, amount);
         emit TimelockActionExecuted(actionHash);
     }
@@ -1153,24 +1305,41 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         }
         require(protocols.length == apys.length, "APY data mismatch");
 
-        uint256 totalAPY = _totalAPY(apys);
+        uint256 totalWeightedAPY = 0;
         uint256 nonRWAAmount = 0;
+
+        // Gas Optimization: Cache weights in memory
+        uint256[] memory weights = new uint256[](protocols.length);
+        for (uint256 i = 0; i < protocols.length; i++) {
+            if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
+                continue;
+            }
+            // New: Stricter RWA validation
+            if (rwaYield.isRWA(protocols[i]) && !validateRWAProtocol(protocols[i])) {
+                emit AllocationSkipped(protocols[i], "RWA validation failed");
+                continue;
+            }
+            uint256 riskScore = protocolRiskScores[protocols[i]] > 0 ? protocolRiskScores[protocols[i]] : 5000;
+            uint256 riskAdjustedAPY = (apys[i] * (10000 - riskScore)) / 10000;
+            weights[i] = riskAdjustedAPY;
+            totalWeightedAPY += riskAdjustedAPY;
+        }
 
         // Allocate to non-RWA protocols
         for (uint256 i = startIndex; i < endIndex && i < protocols.length; i++) {
-            if (rwaYield.isRWA(protocols[i])) {
+            if (rwaYield.isRWA(protocols[i]) || weights[i] == 0) {
                 continue;
             }
-            if (!_isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
-                emit AllocationSkipped(protocols[i], "Invalid protocol or APY");
-                continue;
-            }
-            uint256 allocAmount = (amount * apys[i]) / totalAPY;
+            uint256 allocAmount = (amount * weights[i]) / (totalWeightedAPY == 0 ? 1 : totalWeightedAPY);
             if (allocAmount < MIN_ALLOCATION) {
                 emit AllocationSkipped(protocols[i], "Amount below minimum");
                 continue;
             }
-            bool isLeveraged = allowLeverage && (protocols[i] == address(flyingTulip) || protocols[i] == address(aavePool) || isCompoundProtocol[protocols[i]]);
+            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[i], allocAmount);
+            // New: Dynamic leverage adjustment
+            if (isLeveraged) {
+                isLeveraged = adjustLeverageDynamically(protocols[i], allocAmount);
+            }
             allocations[protocols[i]] = Allocation(protocols[i], allocAmount, apys[i], block.timestamp, isLeveraged);
             lastKnownAPYs[protocols[i]] = apys[i];
             if (!isActiveProtocol[protocols[i]]) {
@@ -1181,30 +1350,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             nonRWAAmount += allocAmount;
             sonicPointsEarned[msg.sender] += allocAmount * 2;
             if (isLeveraged) {
-                uint256 ltv;
-                if (protocols[i] == address(flyingTulip)) {
-                    ltv = flyingTulip.getLTV(protocols[i], allocAmount);
-                } else if (protocols[i] == address(aavePool)) {
-                    ltv = aavePool.getUserAccountData(address(this)).ltv;
-                } else if (isCompoundProtocol[protocols[i]]) {
-                    (, uint256 collateralFactor, ) = ICompound(protocols[i]).getAccountLiquidity(address(this));
-                    ltv = (collateralFactor * BASIS_POINTS) / 1e18;
-                }
-                ltv = ltv > MAX_LTV ? MAX_LTV : ltv;
-                uint256 borrowAmount = (allocAmount * ltv) / BASIS_POINTS;
-                if (borrowAmount > 0 && borrowAmount <= MAX_BORROW_AMOUNT && _checkLiquidationRisk(protocols[i], allocAmount, borrowAmount)) {
-                    if (protocols[i] == address(flyingTulip)) {
-                        flyingTulip.borrowWithLTV(protocols[i], allocAmount, borrowAmount);
-                    } else if (protocols[i] == address(aavePool)) {
-                        _borrowFromAave(protocols[i], allocAmount, borrowAmount);
-                    } else if (isCompoundProtocol[protocols[i]]) {
-                        _borrowFromCompound(protocols[i], allocAmount, borrowAmount);
-                    }
-                    emit LTVBorrow(protocols[i], allocAmount, borrowAmount);
-                } else {
-                    emit AllocationSkipped(protocols[i], "Liquidation risk too high");
-                }
+                _applyLeverage(protocols[i], allocAmount);
             }
+            emit AIAllocationOptimized(protocols[i], allocAmount, apys[i], isLeveraged);
             emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
         }
 
@@ -1212,10 +1360,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         uint256 rwaAmount = amount > nonRWAAmount ? amount - nonRWAAmount : 0;
         if (rwaAmount >= MIN_ALLOCATION) {
             (address[] memory rwaProtocols, uint256[] memory amounts, bool[] memory isLeveraged) = aiYieldOptimizer.getRecommendedAllocations(rwaAmount);
+            // New: Validate AI allocations
+            require(validateAIAllocations(rwaProtocols, amounts, rwaAmount), "Invalid AI allocations");
             stablecoin.safeApprove(address(aiYieldOptimizer), 0);
             stablecoin.safeApprove(address(aiYieldOptimizer), rwaAmount);
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
             aiYieldOptimizer.submitAIAllocation(rwaProtocols, amounts, isLeveraged);
+            // New: Emit AI allocation details
+            string memory logicDescription = aiYieldOptimizer.getAllocationLogic(rwaAmount);
+            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription);
             sonicPointsEarned[msg.sender] += rwaAmount * 2;
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
@@ -1230,7 +1383,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         address[] memory sortedProtocols = _sortProtocolsByLiquidity();
         address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
 
-        // First, withdraw from RWA protocols via AIYieldOptimizer
+        // Withdraw from RWA protocols
         uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
         if (rwaBalance > 0) {
             uint256 rwaWithdrawAmount = (amount * rwaBalance) / (totalAllocated == 0 ? 1 : totalAllocated);
@@ -1241,7 +1394,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                     uint256 withdrawAmount = rwaWithdrawAmount > availableLiquidity ? availableLiquidity : rwaWithdrawAmount;
                     try aiYieldOptimizer.withdrawForYieldOptimizer(protocol, withdrawAmount) returns (uint256 withdrawn) {
                         totalWithdrawn += withdrawn;
-                        sonicPointsEarned[msg.sender] += withdrawn; // 1x points for deallocation
+                        sonicPointsEarned[msg.sender] += withdrawn;
                     } catch {
                         emit WithdrawalFailed(protocol, withdrawAmount);
                     }
@@ -1249,11 +1402,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             }
         }
 
-        // Then, withdraw from non-RWA protocols
+        // Withdraw from non-RWA protocols
         for (uint256 i = startIndex; i < endIndex && totalWithdrawn < amount; i++) {
             address protocol = sortedProtocols[i];
             if (rwaYield.isRWA(protocol)) {
-                continue; // Skip RWA protocols, already handled
+                continue;
             }
             Allocation storage alloc = allocations[protocol];
             uint256 withdrawAmount = (amount * alloc.amount) / (totalAllocated == 0 ? 1 : totalAllocated);
@@ -1263,7 +1416,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 uint256 withdrawn = _withdrawFromProtocol(protocol, withdrawAmount);
                 alloc.amount -= withdrawn;
                 totalWithdrawn += withdrawn;
-                sonicPointsEarned[msg.sender] += withdrawn; // 1x points for deallocation
+                sonicPointsEarned[msg.sender] += withdrawn;
             }
         }
         _cleanAllocations();
@@ -1289,7 +1442,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 revert("Aave supply failed");
             }
         } else if (isCompoundProtocol[protocol]) {
-            try ICompound(protocol).mint(amount) returns (uint256 err) {
+            try compound.mint(amount) returns (uint256 err) {
                 require(err == 0, "Compound mint failed");
                 emit CompoundSupply(protocol, amount, protocol);
             } catch {
@@ -1315,7 +1468,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                     : protocol == address(aavePool)
                         ? aavePool.withdraw(address(stablecoin), amount, address(this))
                         : isCompoundProtocol[protocol]
-                            ? ICompound(protocol).redeemUnderlying(amount) == 0 ? amount : 0
+                            ? compound.redeemUnderlying(amount) == 0 ? amount : 0
                             : defiYield.withdrawFromDeFi(protocol, amount)
         returns (uint256 amountWithdrawn) {
             withdrawn = amountWithdrawn;
@@ -1344,7 +1497,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         address[] memory sortedProtocols = _sortProtocolsByLiquidity();
         address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
 
-        // First, withdraw from RWA protocols via AIYieldOptimizer
+        // Withdraw from RWA protocols
         uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
         if (rwaBalance > 0) {
             uint256 rwaWithdrawAmount = amount > rwaBalance ? rwaBalance : amount;
@@ -1361,11 +1514,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             }
         }
 
-        // Then, withdraw from non-RWA protocols
+        // Withdraw from non-RWA protocols
         for (uint256 i = 0; i < sortedProtocols.length && totalWithdrawn < amount; i++) {
             address protocol = sortedProtocols[i];
             if (rwaYield.isRWA(protocol)) {
-                continue; // Skip RWA protocols, already handled
+                continue;
             }
             Allocation storage alloc = allocations[protocol];
             uint256 availableLiquidity = getProtocolLiquidity(protocol);
@@ -1398,248 +1551,129 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
      * @notice Cleans up zero-amount allocations efficiently.
      */
     function _cleanAllocations() internal {
+        // Gas Optimization: Single-pass cleanup with dynamic resize
         uint256 writeIndex = 0;
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            address protocol = activeProtocols[i];
-            if (allocations[protocol].amount == 0) {
-                delete allocations[protocol];
-                isActiveProtocol[protocol] = false;
-            } else {
+        address[] memory tempProtocols = activeProtocols;
+        for (uint256 i = 0; i < tempProtocols.length; i++) {
+            address protocol = tempProtocols[i];
+            if (allocations[protocol].amount > 0) {
                 if (i != writeIndex) {
                     activeProtocols[writeIndex] = protocol;
                 }
                 writeIndex++;
+            } else {
+                delete allocations[protocol];
+                isActiveProtocol[protocol] = false;
             }
         }
+        // Resize activeProtocols array
         while (activeProtocols.length > writeIndex) {
             activeProtocols.pop();
         }
     }
 
-    /**
+        /**
      * @notice Validates a protocol for allocation with Sonic compliance.
      */
     function _isValidProtocol(address protocol) internal view returns (bool) {
         return whitelistedProtocols[protocol] &&
             (address(protocolAPYFeeds[protocol]) != address(0) || lastKnownAPYs[protocol] > 0 || protocol == address(aavePool) || isCompoundProtocol[protocol]) &&
-            (rwaYield.isRWA(protocol) || protocol == address(flyingTulip) || protocol == address(aavePool) || isCompoundProtocol[protocol] || _isDeFiProtocol(protocol)) &&
-            checkProtocolHealth(protocol) &&
+            (rwaYield.isRWA(protocol) || protocol == address(flyingTulip) || protocol == address(aavePool) || isCompoundProtocol[protocol] || defiYield.isDeFiProtocol(protocol)) &&
             sonicProtocol.isSonicCompliant(protocol);
     }
 
     /**
-     * @notice Checks if a protocol is a valid DeFi protocol.
-     */
-    function _isDeFiProtocol(address protocol) internal view returns (bool) {
-        return defiYield.isDeFiProtocol(protocol);
-    }
-
-    /**
-     * @notice Validates APY data from Chainlink, RedStone, or Aave/Compound.
+     * @notice Validates APY data for a protocol.
      */
     function _validateAPY(uint256 apy, address protocol) internal view returns (bool) {
-        if (apy == 0 || apy > MAX_APY) return false;
-        if (lastKnownAPYs[protocol] > 0) {
-            uint256 delta = apy > lastKnownAPYs[protocol]
-                ? apy - lastKnownAPYs[protocol]
-                : lastKnownAPYs[protocol] - apy;
-            return delta * 100 / lastKnownAPYs[protocol] <= 50; // Max 50% deviation
-        }
-        return true;
+        uint256 liquidity = getProtocolLiquidity(protocol);
+        return apy > 0 && apy <= MAX_APY && liquidity > 0;
     }
 
     /**
-     * @notice Checks protocol health, including Aave, Compound, and Sonic-specific checks.
+     * @notice Fetches APYs from Chainlink/RedStone oracles with fallback to protocol-direct sources.
      */
-    function checkProtocolHealth(address protocol) internal view returns (bool) {
-        if (protocol == address(flyingTulip)) {
-            return flyingTulip.isProtocolHealthy(protocol);
-        } else if (protocol == address(aavePool)) {
-            (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(address(this));
-            return healthFactor >= MIN_HEALTH_FACTOR;
-        } else if (isCompoundProtocol[protocol]) {
-            (, uint256 collateralFactor, ) = ICompound(protocol).getAccountLiquidity(address(this));
-            return collateralFactor >= MIN_COLLATERAL_FACTOR;
-        }
-        return true;
-    }
+    function _getAPYsFromChainlink() internal view returns (address[] memory protocols, uint256[] memory apys) {
+        // Gas Optimization: Pre-allocate arrays with max size
+        address[] memory tempProtocols = new address[](MAX_PROTOCOLS);
+        uint256[] memory tempAPYs = new uint256[](MAX_PROTOCOLS);
+        uint256 count = 0;
 
-    /**
-     * @notice Checks liquidation risk for leveraged positions.
-     */
-    function _checkLiquidationRisk(address protocol, uint256 collateral, uint256 borrowAmount) internal view returns (bool) {
-        if (protocol == address(flyingTulip)) {
-            return flyingTulip.isProtocolHealthy(protocol) &&
-                   flyingTulip.getLTV(protocol, collateral) <= MAX_LTV &&
-                   getProtocolLiquidity(protocol) >= borrowAmount;
-        } else if (protocol == address(aavePool)) {
-            (, , uint256 availableBorrowsBase, , , uint256 healthFactor) = aavePool.getUserAccountData(address(this));
-            return healthFactor >= MIN_HEALTH_FACTOR &&
-                   borrowAmount <= availableBorrowsBase &&
-                   getProtocolLiquidity(protocol) >= borrowAmount;
-        } else if (isCompoundProtocol[protocol]) {
-            (, uint256 collateralFactor, uint256 liquidity) = ICompound(protocol).getAccountLiquidity(address(this));
-            return collateralFactor >= MIN_COLLATERAL_FACTOR &&
-                   borrowAmount <= liquidity &&
-                   getProtocolLiquidity(protocol) >= borrowAmount;
-        }
-        return true;
-    }
-
-    /**
-     * @notice Sorts protocols by allocation size (descending) using insertion sort.
-     */
-    function _sortProtocolsByAllocation() internal view returns (address[] memory) {
-        address[] memory sorted = new address[](activeProtocols.length);
-        uint256[] memory amounts = new uint256[](activeProtocols.length);
-
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            sorted[i] = activeProtocols[i];
-            amounts[i] = allocations[activeProtocols[i]].amount;
-        }
-
-        for (uint256 i = 1; i < sorted.length; i++) {
-            address keyProtocol = sorted[i];
-            uint256 keyAmount = amounts[i];
-            uint256 j = i;
-            while (j > 0 && amounts[j - 1] < keyAmount) {
-                sorted[j] = sorted[j - 1];
-                amounts[j] = amounts[j - 1];
-                j--;
-            }
-            sorted[j] = keyProtocol;
-            amounts[j] = keyAmount;
-        }
-
-        return sorted;
-    }
-
-    /**
-     * @notice Sorts protocols by available liquidity (descending) using insertion sort.
-     */
-    function _sortProtocolsByLiquidity() internal view returns (address[] memory) {
-        address[] memory sorted = new address[](activeProtocols.length);
-        uint256[] memory liquidities = new uint256[](activeProtocols.length);
-
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            sorted[i] = activeProtocols[i];
-            liquidities[i] = getProtocolLiquidity(activeProtocols[i]);
-        }
-
-        for (uint256 i = 1; i < sorted.length; i++) {
-            address keyProtocol = sorted[i];
-            uint256 keyLiquidity = liquidities[i];
-            uint256 j = i;
-            while (j > 0 && liquidities[j - 1] < keyLiquidity) {
-                sorted[j] = sorted[j - 1];
-                liquidities[j] = liquidities[j - 1];
-                j--;
-            }
-            sorted[j] = keyProtocol;
-            liquidities[j] = keyLiquidity;
-        }
-
-        return sorted;
-    }
-
-    /**
-     * @notice Fetches APY data with Sonic RedStone oracle support.
-     */
-    function _getAPYsFromChainlink() internal returns (address[] memory protocols, uint256[] memory apys) {
-        uint256 totalFeeds = 0;
-        uint256 failedFeeds = 0;
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            if (address(protocolAPYFeeds[activeProtocols[i]]) != address(0)) {
-                totalFeeds++;
-            }
-        }
-
-        address[] memory tempProtocols = new address[](activeProtocols.length);
-        uint256[] memory tempAPYs = new uint256[](activeProtocols.length);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
+        for (uint256 i = 0; i < activeProtocols.length && count < MAX_PROTOCOLS; i++) {
             address protocol = activeProtocols[i];
+            if (!_isValidProtocol(protocol)) {
+                continue;
+            }
+            uint256 apy;
             AggregatorV3Interface feed = protocolAPYFeeds[protocol];
+            bool feedValid = false;
+
+            // Try Chainlink/RedStone feed first
             if (address(feed) != address(0)) {
                 try feed.latestRoundData() returns (uint80, int256 answer, , uint256 updatedAt, uint80) {
                     if (answer > 0 && block.timestamp <= updatedAt + MAX_STALENESS && uint256(answer) <= MAX_APY) {
-                        tempProtocols[index] = protocol;
-                        tempAPYs[index] = uint256(answer);
-                        index++;
-                        continue;
-                    } else {
-                        failedFeeds++;
+                        apy = uint256(answer);
+                        feedValid = true;
                     }
                 } catch {
-                    failedFeeds++;
+                    // Fallback to protocol-direct APY
                 }
             }
-            if (protocol == address(aavePool)) {
-                uint256 aaveAPY = _getAaveAPY(address(stablecoin));
-                if (aaveAPY > 0 && aaveAPY <= MAX_APY) {
-                    tempProtocols[index] = protocol;
-                    tempAPYs[index] = aaveAPY;
-                    index++;
-                    continue;
-                }
-            } else if (isCompoundProtocol[protocol]) {
-                uint256 compoundAPY = _getCompoundAPY(protocol);
-                if (compoundAPY > 0 && compoundAPY <= MAX_APY) {
-                    tempProtocols[index] = protocol;
-                    tempAPYs[index] = compoundAPY;
-                    index++;
-                    continue;
-                }
-            } else {
-                uint256 sonicAPY = sonicProtocol.getSonicAPY(protocol);
-                if (sonicAPY > 0 && sonicAPY <= MAX_APY) {
-                    tempProtocols[index] = protocol;
-                    tempAPYs[index] = sonicAPY;
-                    index++;
-                    continue;
+
+            // Fallback to protocol-direct APY sources
+            if (!feedValid) {
+                try this._getProtocolDirectAPY(protocol) returns (uint256 directAPY) {
+                    if (directAPY > 0 && directAPY <= MAX_APY) {
+                        apy = directAPY;
+                    } else {
+                        apy = lastKnownAPYs[protocol];
+                    }
+                } catch {
+                    apy = lastKnownAPYs[protocol];
                 }
             }
-            if (lastKnownAPYs[protocol] > 0) {
-                tempProtocols[index] = protocol;
-                tempAPYs[index] = lastKnownAPYs[protocol];
-                index++;
+
+            if (apy > 0) {
+                tempProtocols[count] = protocol;
+                tempAPYs[count] = apy;
+                count++;
             }
         }
 
-        if (totalFeeds > 0 && (failedFeeds * 100) / totalFeeds > MAX_FEED_FAILURES) {
-            _pause();
-            emit CircuitBreakerTriggered(failedFeeds, totalFeeds);
-            revert("Circuit breaker: Too many feed failures");
-        }
-
-        protocols = new address[](index);
-        apys = new uint256[](index);
-        for (uint256 i = 0; i < index; i++) {
+        // Resize arrays to actual size
+        protocols = new address[](count);
+        apys = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
             protocols[i] = tempProtocols[i];
             apys[i] = tempAPYs[i];
         }
     }
 
     /**
-     * @notice Gets Aave's variable APY for the stablecoin.
+     * @notice Fetches APY directly from protocol interfaces (Aave, Compound, etc.).
+     */
+    function _getProtocolDirectAPY(address protocol) external view returns (uint256) {
+        if (protocol == address(aavePool)) {
+            return _getAaveAPY(address(stablecoin));
+        } else if (isCompoundProtocol[protocol]) {
+            return _getCompoundAPY(protocol);
+        } else if (protocol == address(flyingTulip)) {
+            return flyingTulip.getDynamicAPY(protocol);
+        } else if (rwaYield.isRWA(protocol)) {
+            return rwaYield.getRWAYield(protocol);
+        } else {
+            return sonicProtocol.getSonicAPY(protocol);
+        }
+    }
+
+    /**
+     * @notice Gets Aave APY for a given asset.
      */
     function _getAaveAPY(address asset) internal view returns (uint256) {
         try aavePool.getReserveData(asset) returns (
-            uint256,
-            uint256,
-            uint256 currentLiquidityRate,
-            uint256,
-            uint256,
-            uint40,
-            address,
-            address,
-            address,
-            address,
-            uint128,
-            uint128,
-            uint128
+            uint256, uint256, uint256 currentLiquidityRate, , , , , , , , , ,
         ) {
+            // Convert liquidity rate to APY (simplified)
             return (currentLiquidityRate * BASIS_POINTS) / 1e27;
         } catch {
             return 0;
@@ -1647,10 +1681,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Gets Compound's supply APY for the cToken.
+     * @notice Gets Compound APY for a given protocol.
      */
-    function _getCompoundAPY(address cToken) internal view returns (uint256) {
-        try ICompound(cToken).supplyRatePerBlock() returns (uint256 ratePerBlock) {
+    function _getCompoundAPY(address protocol) internal view returns (uint256) {
+        try compound.supplyRatePerBlock() returns (uint256 ratePerBlock) {
+            // Convert rate per block to annual APY
             return (ratePerBlock * BLOCKS_PER_YEAR * BASIS_POINTS) / 1e18;
         } catch {
             return 0;
@@ -1658,189 +1693,254 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Calculates total APY for allocation.
+     * @notice Sorts protocols by available liquidity for efficient withdrawals.
      */
-    function _totalAPY(uint256[] memory apys) internal pure returns (uint256) {
-        uint256 total = 0;
-        for (uint256 i = 0; i < apys.length; i++) {
-            total += apys[i];
+    function _sortProtocolsByLiquidity() internal view returns (address[] memory) {
+        address[] memory sortedProtocols = new address[](activeProtocols.length);
+        uint256[] memory liquidities = new uint256[](activeProtocols.length);
+
+        // Collect liquidities
+        for (uint256 i = 0; i < activeProtocols.length; i++) {
+            sortedProtocols[i] = activeProtocols[i];
+            liquidities[i] = getProtocolLiquidity(activeProtocols[i]);
         }
-        return total == 0 ? 1 : total;
+
+        // Gas Optimization: Simple bubble sort for small arrays
+        for (uint256 i = 0; i < activeProtocols.length; i++) {
+            for (uint256 j = i + 1; j < activeProtocols.length; j++) {
+                if (liquidities[i] < liquidities[j]) {
+                    (sortedProtocols[i], sortedProtocols[j]) = (sortedProtocols[j], sortedProtocols[i]);
+                    (liquidities[i], liquidities[j]) = (liquidities[j], liquidities[i]);
+                }
+            }
+        }
+
+        return sortedProtocols;
     }
 
     /**
-     * @notice Computes e^x using PRBMath for fixed-point arithmetic.
-     * @param x The exponent scaled by FIXED_POINT_SCALE (1e18).
-     * @return The result scaled by FIXED_POINT_SCALE.
+     * @notice Checks liquidation risk for leveraged positions.
      */
-    function _exp(uint256 x) internal pure returns (uint256) {
-        require(x <= MAX_EXP_INPUT, "Exponent too large");
-        if (x < 1e16) return FIXED_POINT_SCALE + x; // Linear approximation for x < 0.01
-        return PRBMathUD60x18.exp(x);
+    function _checkLiquidationRisk(address protocol, uint256 collateral, uint256 borrowAmount) internal view returns (bool) {
+        if (protocol == address(flyingTulip)) {
+            uint256 ltv = flyingTulip.getLTV(protocol, collateral);
+            return ltv <= MAX_LTV && borrowAmount <= collateral * ltv / BASIS_POINTS;
+        } else if (protocol == address(aavePool)) {
+            (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(address(this));
+            return healthFactor >= MIN_HEALTH_FACTOR;
+        } else if (isCompoundProtocol[protocol]) {
+            (, uint256 collateralFactor, uint256 liquidity) = compound.getAccountLiquidity(address(this));
+            return collateralFactor >= MIN_COLLATERAL_FACTOR && borrowAmount <= liquidity;
+        }
+        return false;
     }
 
-        /**
-     * @notice Calculates user profit with protocol-specific compounding.
-     * @param user The user’s address.
-     * @param amount The amount being withdrawn.
-     * @return The calculated profit.
+    /**
+     * @notice Calculates user profit with PRBMath for compound interest.
      */
     function _calculateProfit(address user, uint256 amount) internal view returns (uint256) {
-        uint256 userShare = (userBalances[user] * FIXED_POINT_SCALE) / (totalAllocated == 0 ? 1 : totalAllocated);
-        uint256 totalProfit = 0;
+        uint256 userBalance = userBalances[user];
+        if (userBalance == 0 || amount > userBalance) {
+            return 0;
+        }
 
-        // Calculate profit from non-RWA protocols
+        uint256 totalProfit = 0;
+        uint256 userShare = (amount * FIXED_POINT_SCALE) / userBalance;
+
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             Allocation memory alloc = allocations[protocol];
-            if (alloc.amount == 0 || rwaYield.isRWA(protocol)) {
+            if (alloc.amount == 0 || alloc.apy == 0) {
                 continue;
             }
             uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
-            uint256 apy = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
-            if (apy == 0 || timeElapsed == 0) {
+            if (timeElapsed == 0) {
                 continue;
             }
-            // Continuous compounding: profit = principal * (e^(APY * time) - 1)
-            uint256 rate = (apy * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
-            uint256 profit = (alloc.amount * userShare * (_exp(rate) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
+
+            // Simplified compound interest using PRBMath
+            uint256 apyScaled = (alloc.apy * FIXED_POINT_SCALE) / BASIS_POINTS;
+            uint256 ratePerSecond = apyScaled / SECONDS_PER_YEAR;
+            uint256 exponent = ratePerSecond * timeElapsed;
+            if (exponent > MAX_EXP_INPUT) {
+                continue;
+            }
+
+            uint256 profitFactor = PRBMathUD60x18.exp(exponent);
+            uint256 principal = (alloc.amount * userShare) / FIXED_POINT_SCALE;
+            uint256 profit = (principal * (profitFactor - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
             totalProfit += profit;
         }
 
-        // Include profit from RWA protocols via AIYieldOptimizer
+        // Include RWA profits from AIYieldOptimizer
         uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
         if (rwaBalance > 0) {
-            uint256 rwaAPY = _getAverageRWAApy();
+            uint256 rwaShare = (rwaBalance * userShare) / FIXED_POINT_SCALE;
+            // Assume average RWA APY (simplified)
+            uint256 rwaAPY = lastKnownAPYs[address(aiYieldOptimizer)] > 0 ? lastKnownAPYs[address(aiYieldOptimizer)] : 500; // 5% default
             uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
-            if (rwaAPY > 0 && timeElapsed > 0) {
-                uint256 rate = (rwaAPY * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
-                uint256 rwaProfit = (rwaBalance * userShare * (_exp(rate) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
-                totalProfit += rwaProfit;
-            }
+            uint256 rwaProfit = (rwaShare * rwaAPY * timeElapsed) / (BASIS_POINTS * SECONDS_PER_YEAR);
+            totalProfit += rwaProfit;
         }
 
-        // Ensure profit is above minimum threshold
         return totalProfit >= MIN_PROFIT ? totalProfit : 0;
     }
 
     /**
-     * @notice Gets the average APY for RWA protocols from AIYieldOptimizer.
-     * @return The average APY in basis points.
+     * @notice Gets user balance with estimated profits and Sonic Points.
      */
-    function _getAverageRWAApy() internal view returns (uint256) {
-        address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
-        uint256 totalAPY = 0;
-        uint256 validProtocols = 0;
-
-        for (uint256 i = 0; i < rwaProtocols.length; i++) {
-            uint256 apy = rwaYield.getRWAYield(rwaProtocols[i]);
-            if (apy > 0 && apy <= MAX_APY) {
-                totalAPY += apy;
-                validProtocols++;
-            }
-        }
-
-        return validProtocols > 0 ? totalAPY / validProtocols : 0;
+    function getUserBalance(address user) external view returns (uint256 balance, uint256 estimatedProfit, uint256 points) {
+        balance = userBalances[user];
+        estimatedProfit = _calculateProfit(user, balance);
+        points = sonicPointsEarned[user];
     }
 
     /**
-     * @notice Gets the user’s current balance including profits.
-     * @param user The user’s address.
-     * @return The total balance including profits.
+     * @notice Gets estimated profit for a user with detailed breakdown.
      */
-    function getUserBalance(address user) external view returns (uint256) {
-        if (userBalances[user] == 0) {
-            return 0;
+    function getEstimatedProfit(address user) external view returns (uint256 totalProfit, AllocationBreakdown[] memory breakdown) {
+        uint256 userBalance = userBalances[user];
+        if (userBalance == 0) {
+            return (0, new AllocationBreakdown[](0));
         }
-        uint256 profit = _calculateProfit(user, userBalances[user]);
-        return userBalances[user] + profit;
-    }
 
-    /**
-     * @notice Gets the total value locked in the contract.
-     * @return The total value including non-RWA and RWA allocations.
-     */
-    function getTotalValueLocked() external view returns (uint256) {
-        uint256 total = totalAllocated;
-        for (uint256 i = 0; i < activeProtocols.length; i++) {
-            address protocol = activeProtocols[i];
-            if (!rwaYield.isRWA(protocol)) {
-                uint256 profit = _calculateProfitForProtocol(protocol);
-                total += profit;
-            }
-        }
-        // Include RWA profits
-        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
-        if (rwaBalance > 0) {
-            uint256 rwaAPY = _getAverageRWAApy();
-            uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
-            if (rwaAPY > 0 && timeElapsed > 0) {
-                uint256 rate = (rwaAPY * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
-                uint256 rwaProfit = (rwaBalance * (_exp(rate) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
-                total += rwaProfit;
-            }
-        }
-        return total;
-    }
+        // Initialize breakdown array
+        breakdown = new AllocationBreakdown[](activeProtocols.length + 1); // +1 for RWA
+        uint256 breakdownIndex = 0;
+        uint256 totalProfit = 0;
+        uint256 userShare = (userBalance * FIXED_POINT_SCALE) / userBalance;
 
-    /**
-     * @notice Calculates profit for a specific protocol.
-     * @param protocol The protocol address.
-     * @return The calculated profit.
-     */
-    function _calculateProfitForProtocol(address protocol) internal view returns (uint256) {
-        Allocation memory alloc = allocations[protocol];
-        if (alloc.amount == 0) {
-            return 0;
-        }
-        uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
-        uint256 apy = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
-        if (apy == 0 || timeElapsed == 0) {
-            return 0;
-        }
-        uint256 rate = (apy * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
-        uint256 profit = (alloc.amount * (_exp(rate) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
-        return profit >= MIN_PROFIT ? profit : 0;
-    }
-
-    /**
-     * @notice Gets the current allocations across all protocols.
-     * @return protocols The list of allocated protocols.
-     * @return amounts The amounts allocated to each protocol.
-     * @return apys The APYs for each protocol.
-     * @return isLeveraged Whether each allocation is leveraged.
-     */
-    function getCurrentAllocations()
-        external
-        view
-        returns (
-            address[] memory protocols,
-            uint256[] memory amounts,
-            uint256[] memory apys,
-            bool[] memory isLeveraged
-        )
-    {
-        protocols = new address[](activeProtocols.length);
-        amounts = new uint256[](activeProtocols.length);
-        apys = new uint256[](activeProtocols.length);
-        isLeveraged = new bool[](activeProtocols.length);
-
+        // Calculate profits for non-RWA protocols
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             Allocation memory alloc = allocations[protocol];
-            protocols[i] = protocol;
-            amounts[i] = alloc.amount;
-            apys[i] = alloc.apy > 0 ? alloc.apy : lastKnownAPYs[protocol];
-            isLeveraged[i] = alloc.isLeveraged;
+            if (alloc.amount == 0 || alloc.apy == 0) {
+                continue;
+            }
+            uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
+            if (timeElapsed == 0) {
+                continue;
+            }
+
+            uint256 apyScaled = (alloc.apy * FIXED_POINT_SCALE) / BASIS_POINTS;
+            uint256 ratePerSecond = apyScaled / SECONDS_PER_YEAR;
+            uint256 exponent = ratePerSecond * timeElapsed;
+            if (exponent > MAX_EXP_INPUT) {
+                continue;
+            }
+
+            uint256 profitFactor = PRBMathUD60x18.exp(exponent);
+            uint256 principal = (alloc.amount * userShare) / FIXED_POINT_SCALE;
+            uint256 profit = (principal * (profitFactor - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
+
+            breakdown[breakdownIndex] = AllocationBreakdown({
+                protocol: protocol,
+                amount: principal,
+                apy: alloc.apy,
+                isLeveraged: alloc.isLeveraged,
+                liquidity: getProtocolLiquidity(protocol),
+                riskScore: protocolRiskScores[protocol]
+            });
+            totalProfit += profit;
+            breakdownIndex++;
         }
 
-        return (protocols, amounts, apys, isLeveraged);
+        // Include RWA profits
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            uint256 rwaShare = (rwaBalance * userShare) / FIXED_POINT_SCALE;
+            uint256 rwaAPY = lastKnownAPYs[address(aiYieldOptimizer)] > 0 ? lastKnownAPYs[address(aiYieldOptimizer)] : 500;
+            uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
+            uint256 rwaProfit = (rwaShare * rwaAPY * timeElapsed) / (BASIS_POINTS * SECONDS_PER_YEAR);
+
+            breakdown[breakdownIndex] = AllocationBreakdown({
+                protocol: address(aiYieldOptimizer),
+                amount: rwaShare,
+                apy: rwaAPY,
+                isLeveraged: false,
+                liquidity: rwaBalance,
+                riskScore: protocolRiskScores[address(aiYieldOptimizer)]
+            });
+            totalProfit += rwaProfit;
+            breakdownIndex++;
+        }
+
+        // Resize breakdown array
+        AllocationBreakdown[] memory finalBreakdown = new AllocationBreakdown[](breakdownIndex);
+        for (uint256 i = 0; i < breakdownIndex; i++) {
+            finalBreakdown[i] = breakdown[i];
+        }
+
+        return (totalProfit >= MIN_PROFIT ? totalProfit : 0, finalBreakdown);
+    }
+
+    /**
+     * @notice Gets detailed allocation breakdown for transparency.
+     */
+    function getAllocationBreakdown() external view returns (AllocationBreakdown[] memory) {
+        // Initialize breakdown array
+        AllocationBreakdown[] memory breakdown = new AllocationBreakdown[](activeProtocols.length + 1); // +1 for RWA
+        uint256 breakdownIndex = 0;
+
+        // Non-RWA protocols
+        for (uint256 i = 0; i < activeProtocols.length; i++) {
+            address protocol = activeProtocols[i];
+            Allocation memory alloc = allocations[protocol];
+            if (alloc.amount == 0) {
+                continue;
+            }
+            breakdown[breakdownIndex] = AllocationBreakdown({
+                protocol: protocol,
+                amount: alloc.amount,
+                apy: alloc.apy,
+                isLeveraged: alloc.isLeveraged,
+                liquidity: getProtocolLiquidity(protocol),
+                riskScore: protocolRiskScores[protocol]
+            });
+            breakdownIndex++;
+        }
+
+        // RWA allocations
+        uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
+        if (rwaBalance > 0) {
+            uint256 rwaAPY = lastKnownAPYs[address(aiYieldOptimizer)] > 0 ? lastKnownAPYs[address(aiYieldOptimizer)] : 500;
+            breakdown[breakdownIndex] = AllocationBreakdown({
+                protocol: address(aiYieldOptimizer),
+                amount: rwaBalance,
+                apy: rwaAPY,
+                isLeveraged: false,
+                liquidity: rwaBalance,
+                riskScore: protocolRiskScores[address(aiYieldOptimizer)]
+            });
+            breakdownIndex++;
+        }
+
+        // Resize breakdown array
+        AllocationBreakdown[] memory finalBreakdown = new AllocationBreakdown[](breakdownIndex);
+        for (uint256 i = 0; i < breakdownIndex; i++) {
+            finalBreakdown[i] = breakdown[i];
+        }
+
+        return finalBreakdown;
+    }
+
+    /**
+     * @notice Gets AI allocation details for transparency.
+     */
+    function getAIAllocationDetails(uint256 amount) external view returns (
+        address[] memory protocols,
+        uint256[] memory amounts,
+        bool[] memory isLeveraged,
+        string memory logicDescription
+    ) {
+        (protocols, amounts, isLeveraged) = aiYieldOptimizer.getRecommendedAllocations(amount);
+        logicDescription = aiYieldOptimizer.getAllocationLogic(amount);
     }
 
     /**
      * @notice Fallback function to prevent accidental ETH deposits.
      */
     receive() external payable {
-        revert("Contract does not accept ETH");
+        revert("ETH deposits not allowed");
     }
-}
+}  
