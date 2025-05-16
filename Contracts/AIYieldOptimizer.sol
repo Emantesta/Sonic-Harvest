@@ -11,7 +11,7 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 
-// Interfaces from YieldOptimizer.sol
+// Interfaces
 interface IRWAYield {
     function depositToRWA(address protocol, uint256 amount) external;
     function withdrawFromRWA(address protocol, uint256 amount) external returns (uint256);
@@ -37,7 +37,8 @@ interface IFlyingTulip {
 /**
  * @title AIYieldOptimizer
  * @dev A delegated contract for AI-driven RWA yield optimization within YieldOptimizer.sol,
- *      integrated with Sonic Blockchain features, governance, leverage, and Chainlink Automation.
+ *      integrated with Sonic Blockchain features, governance, leverage, Chainlink Automation,
+ *      and advanced AI-driven allocation strategies with dynamic risk assessment.
  */
 contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     using SafeERC20 for IERC20;
@@ -49,7 +50,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     IRWAYield public immutable rwaYield; // RWAYield contract
     ISonicProtocol public immutable sonicProtocol; // Sonic compliance and APY
     IFlyingTulip public immutable flyingTulip; // FlyingTulip for leverage
-    address public governance; // Multi-sig or DAO, aligned with YieldOptimizer.sol
+    address public governance; // Multi-sig or DAO
     address public feeRecipient; // Receives Fee Monetization rewards
     address public aiOracle; // Address for AI allocation recommendations
     uint256 public feeMonetizationShare; // Sonic FeeM share (default 90%)
@@ -63,6 +64,8 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     mapping(address => Allocation) public allocations; // Protocol allocations
     bool public allowLeverage; // Toggle for leverage support
     uint256 public lastUpkeepTimestamp; // Last Chainlink upkeep
+    uint256 public volatilityTolerance; // Basis points (e.g., 1000 = 10% max volatility)
+    mapping(address => uint256) public protocolVolatility; // Protocol-specific volatility score
 
     // Governance timelock actions
     struct TimelockAction {
@@ -108,6 +111,8 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     event TimelockActionProposed(bytes32 indexed actionHash, uint256 timestamp);
     event TimelockActionExecuted(bytes32 indexed actionHash);
     event ManualUpkeepTriggered(uint256 timestamp);
+    event AIVolatilityAssessmentUpdated(address indexed protocol, uint256 volatilityScore);
+    event AIRecommendedAllocation(address indexed protocol, uint256 amount, bool isLeveraged);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -168,6 +173,28 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         feeMonetizationShare = 90; // 90% for Sonic FeeM
         allowLeverage = false;
         lastUpkeepTimestamp = block.timestamp;
+        volatilityTolerance = 1000; // 10% default volatility tolerance
+    }
+
+    /**
+     * @dev Sets volatility tolerance for AI-driven allocations
+     * @param _volatilityTolerance Volatility tolerance in basis points (max 20%)
+     */
+    function setVolatilityTolerance(uint256 _volatilityTolerance) external onlyGovernance sonicFeeMonetization {
+        require(_volatilityTolerance <= 2000, "Volatility tolerance too high"); // Max 20%
+        volatilityTolerance = _volatilityTolerance;
+    }
+
+    /**
+     * @dev Updates protocol volatility score based on AI assessment
+     * @param protocol RWA protocol address
+     * @param volatilityScore Volatility score in basis points
+     */
+    function updateProtocolVolatility(address protocol, uint256 volatilityScore) external onlyGovernance sonicFeeMonetization {
+        require(isSupportedProtocol[protocol], "Unsupported protocol");
+        require(volatilityScore <= 10000, "Invalid volatility score");
+        protocolVolatility[protocol] = volatilityScore;
+        emit AIVolatilityAssessmentUpdated(protocol, volatilityScore);
     }
 
     /**
@@ -181,6 +208,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         require(!isSupportedProtocol[protocol], "Protocol already supported");
         require(rwaYield.isRWA(protocol), "Not an RWA protocol");
         require(sonicProtocol.isSonicCompliant(protocol), "Protocol not Sonic compliant");
+        require(supportedProtocols.length < MAX_PROTOCOLS, "Max protocols reached");
 
         bytes32 actionHash = keccak256(abi.encode("addProtocol", protocol, apyFeed));
         timelockActions[actionHash] = TimelockAction(actionHash, block.timestamp + TIMELOCK_DELAY);
@@ -200,6 +228,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         supportedProtocols.push(protocol);
         isSupportedProtocol[protocol] = true;
         protocolAPYFeeds[protocol] = AggregatorV3Interface(apyFeed);
+        protocolVolatility[protocol] = 5000; // Default 50% volatility score
         delete timelockActions[actionHash];
 
         emit ProtocolAdded(protocol);
@@ -230,6 +259,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
 
         isSupportedProtocol[protocol] = false;
         delete protocolAPYFeeds[protocol];
+        delete protocolVolatility[protocol];
         delete allocations[protocol];
 
         for (uint256 i = 0; i < supportedProtocols.length; i++) {
@@ -348,6 +378,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
             require(isSupportedProtocol[protocols[i]], "Unsupported protocol");
             require(sonicProtocol.isSonicCompliant(protocols[i]), "Protocol not Sonic compliant");
             require(flyingTulip.isProtocolHealthy(protocols[i]), "Protocol not healthy");
+            require(protocolVolatility[protocols[i]] <= volatilityTolerance, "Protocol too volatile");
             totalAmount = totalAmount.add(amounts[i]);
         }
         require(totalAmount <= stablecoin.balanceOf(address(this)), "Insufficient balance");
@@ -365,6 +396,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
                 );
                 sonicPointsEarned[msg.sender] += amounts[i] * 2; // 2x points for allocation
                 emit AIAllocationUpdated(protocols[i], amounts[i]);
+                emit AIRecommendedAllocation(protocols[i], amounts[i], isLeveraged[i] && allowLeverage);
             }
         }
     }
@@ -382,7 +414,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
         rwaBalances[protocol] = rwaBalances[protocol].add(amount);
         totalRWABalance = totalRWABalance.add(amount);
 
-        if (isLeveraged) {
+        if (isLeveraged && _assessLeverageViability(protocol, amount)) {
             uint256 ltv = flyingTulip.getLTV(protocol, amount);
             ltv = ltv > MAX_LTV ? MAX_LTV : ltv;
             uint256 borrowAmount = (amount * ltv) / BASIS_POINTS;
@@ -394,6 +426,8 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
             } else {
                 isLeveraged = false; // Disable leverage if risk check fails
             }
+        } else {
+            isLeveraged = false; // Disable leverage if viability check fails
         }
 
         emit DepositRWA(protocol, amount, isLeveraged);
@@ -478,6 +512,7 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
                 );
                 sonicPointsEarned[msg.sender] += amounts[i] * 2; // 2x points for reallocation
                 emit AIAllocationUpdated(protocols[i], amounts[i]);
+                emit AIRecommendedAllocation(protocols[i], amounts[i], isLeveraged[i] && allowLeverage);
             }
         }
     }
@@ -574,6 +609,94 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     }
 
     /**
+     * @dev Assesses leverage viability for RWA protocols
+     * @param protocol RWA protocol address
+     * @param amount Amount to deposit
+     * @return True if leverage is viable
+     */
+    function _assessLeverageViability(address protocol, uint256 amount) internal view returns (bool) {
+        uint256 ltv = flyingTulip.getLTV(protocol, amount);
+        uint256 volatility = protocolVolatility[protocol] > 0 ? protocolVolatility[protocol] : 5000; // Default 50%
+        return volatility < 7000 && // Max 70% volatility
+               ltv <= MAX_LTV &&
+               _checkLiquidationRisk(protocol, amount, (amount * ltv) / BASIS_POINTS);
+    }
+
+    /**
+     * @dev AI-driven allocation recommendations with volatility adjustment
+     * @param totalAmount Total amount to allocate
+     * @return protocols Array of recommended protocols
+     * @return amounts Array of recommended amounts
+     * @return isLeveraged Array indicating leverage use
+     */
+    function getRecommendedAllocations(uint256 totalAmount)
+        external
+        returns (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged)
+    {
+        (address[] memory allProtocols, uint256[] memory apys) = getAllYields();
+        protocols = new address[](allProtocols.length);
+        amounts = new uint256[](allProtocols.length);
+        isLeveraged = new bool[](allProtocols.length);
+        uint256 totalWeightedAPY;
+
+        // Calculate volatility-adjusted weights
+        uint256[] memory weights = new uint256[](allProtocols.length);
+        for (uint256 i = 0; i < allProtocols.length; i++) {
+            uint256 volatility = protocolVolatility[allProtocols[i]] > 0 ? protocolVolatility[allProtocols[i]] : 5000; // Default 50%
+            if (volatility > volatilityTolerance) {
+                continue;
+            }
+            uint256 adjustedAPY = (apys[i] * (10000 - volatility)) / 10000;
+            weights[i] = adjustedAPY;
+            totalWeightedAPY += adjustedAPY;
+        }
+
+        uint256 allocated;
+        uint256 index;
+        for (uint256 i = 0; i < allProtocols.length; i++) {
+            if (weights[i] == 0) {
+                continue;
+            }
+            uint256 amount = (totalAmount * weights[i]) / (totalWeightedAPY == 0 ? 1 : totalWeightedAPY);
+            if (amount < 1e16) { // Minimum allocation threshold (0.01 stablecoin units)
+                continue;
+            }
+            protocols[index] = allProtocols[i];
+            amounts[index] = amount;
+            isLeveraged[index] = allowLeverage && _assessLeverageViability(allProtocols[i], amount);
+            allocated += amount;
+            if (msg.sender == aiOracle) {
+                emit AIRecommendedAllocation(allProtocols[i], amount, isLeveraged[index]);
+            }
+            index++;
+        }
+
+        // Resize arrays to remove unused slots
+        assembly {
+            mstore(protocols, index)
+            mstore(amounts, index)
+            mstore(isLeveraged, index)
+        }
+
+        // Adjust for rounding errors
+        if (allocated < totalAmount && index > 0) {
+            amounts[0] += totalAmount - allocated;
+        }
+    }
+
+    /**
+     * @dev Returns active allocations
+     * @return Array of Allocation structs
+     */
+    function getAllocations() external view returns (Allocation[] memory) {
+        Allocation[] memory result = new Allocation[](supportedProtocols.length);
+        for (uint256 i = 0; i < supportedProtocols.length; i++) {
+            result[i] = allocations[supportedProtocols[i]];
+        }
+        return result;
+    }
+
+    /**
      * @dev Checks if upkeep is needed for Chainlink Automation
      * @param checkData Additional data (unused)
      * @return upkeepNeeded Whether upkeep is needed
@@ -625,36 +748,4 @@ contract AIYieldOptimizer is ReentrancyGuard, AutomationCompatibleInterface {
     function getSupportedProtocols() external view returns (address[] memory) {
         return supportedProtocols;
     }
-
-    function getRecommendedAllocations(uint256 totalAmount)
-    external
-    view
-    returns (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged)
-{
-    (address[] memory allProtocols, uint256[] memory apys) = getAllYields();
-    protocols = allProtocols;
-    amounts = new uint256[](allProtocols.length);
-    isLeveraged = new bool[](allProtocols.length);
-    uint256 totalAPY;
-    for (uint256 i = 0; i < allProtocols.length; i++) {
-        totalAPY = totalAPY.add(apys[i]);
-    }
-    for (uint256 i = 0; i < allProtocols.length; i++) {
-        amounts[i] = totalAPY > 0 ? (totalAmount * apys[i]) / totalAPY : 0;
-        isLeveraged[i] = allowLeverage && flyingTulip.getLTV(allProtocols[i], amounts[i]) <= MAX_LTV;
-    }
-
-    /**
-     * @dev Returns active allocations
-     * @return Array of Allocation structs
-     */
-    function getAllocations() external view returns (Allocation[] memory) {
-        Allocation[] memory result = new Allocation[](supportedProtocols.length);
-        for (uint256 i = 0; i < supportedProtocols.length; i++) {
-            result[i] = allocations[supportedProtocols[i]];
-        }
-        return result;
-    }
 }
-
-    
