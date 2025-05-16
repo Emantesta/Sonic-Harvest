@@ -11,6 +11,9 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
+// PRBMath import
+import "@prb/math/PRBMathUD60x18.sol";
+
 // Chainlink imports
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
@@ -133,6 +136,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     uint256 public performanceFee; // Basis points (e.g., 1000 = 10%)
     uint256 public feeMonetizationShare; // Sonic FeeM share (default 90%)
     uint256 public totalFeeMonetizationRewards; // Accumulated FeeM rewards
+    uint256 public totalAllocated; // Total funds allocated
+    uint256 public lastUpkeepTimestamp; // Last Chainlink upkeep
     uint256 public immutable MIN_DEPOSIT;
     uint256 public constant MAX_PROTOCOLS = 10;
     uint256 public constant MAX_LTV = 8000; // 80% LTV cap
@@ -158,8 +163,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     mapping(address => bool) public isActiveProtocol; // Active protocols
     address[] public activeProtocols; // List of active protocols
     mapping(address => uint256) public userBalances; // User deposits
-    uint256 public totalAllocated; // Total funds allocated
-    uint256 public lastUpkeepTimestamp; // Last Chainlink upkeep
 
     // Governance timelock actions
     struct TimelockAction {
@@ -1556,12 +1559,14 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
     }
 
     /**
-     * @notice Computes e^x using OpenZeppelin's Math library for precision.
+     * @notice Computes e^x using PRBMath for fixed-point arithmetic.
+     * @param x The exponent scaled by FIXED_POINT_SCALE (1e18).
+     * @return The result scaled by FIXED_POINT_SCALE.
      */
     function _exp(uint256 x) internal pure returns (uint256) {
         require(x <= MAX_EXP_INPUT, "Exponent too large");
         if (x < 1e16) return FIXED_POINT_SCALE + x; // Linear approximation for x < 0.01
-        return Math.exp(x, FIXED_POINT_SCALE);
+        return PRBMathUD60x18.exp(x);
     }
 
         /**
@@ -1587,20 +1592,19 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
                 continue;
             }
             // Continuous compounding: profit = principal * (e^(APY * time) - 1)
-            uint256 rate = (apy * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
-            uint256 profit = (alloc.amount * userShare * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
+            uint256 rate = (apy * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
+            uint256 profit = (alloc.amount * userShare * (_exp(rate) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
             totalProfit += profit;
         }
 
         // Include profit from RWA protocols via AIYieldOptimizer
         uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
         if (rwaBalance > 0) {
-            // Assume AIYieldOptimizer provides an average APY for RWA allocations
             uint256 rwaAPY = _getAverageRWAApy();
             uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
             if (rwaAPY > 0 && timeElapsed > 0) {
-                uint256 rate = (rwaAPY * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
-                uint256 rwaProfit = (rwaBalance * userShare * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
+                uint256 rate = (rwaAPY * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
+                uint256 rwaProfit = (rwaBalance * userShare * (_exp(rate) - FIXED_POINT_SCALE)) / (FIXED_POINT_SCALE * FIXED_POINT_SCALE);
                 totalProfit += rwaProfit;
             }
         }
@@ -1661,8 +1665,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
             uint256 rwaAPY = _getAverageRWAApy();
             uint256 timeElapsed = block.timestamp - lastUpkeepTimestamp;
             if (rwaAPY > 0 && timeElapsed > 0) {
-                uint256 rate = (rwaAPY * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
-                uint256 rwaProfit = (rwaBalance * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
+                uint256 rate = (rwaAPY * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
+                uint256 rwaProfit = (rwaBalance * (_exp(rate) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
                 total += rwaProfit;
             }
         }
@@ -1684,8 +1688,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard,
         if (apy == 0 || timeElapsed == 0) {
             return 0;
         }
-        uint256 rate = (apy * timeElapsed) / SECONDS_PER_YEAR / BASIS_POINTS;
-        uint256 profit = (alloc.amount * (_exp(rate * FIXED_POINT_SCALE) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
+        uint256 rate = (apy * timeElapsed * FIXED_POINT_SCALE) / (SECONDS_PER_YEAR * BASIS_POINTS);
+        uint256 profit = (alloc.amount * (_exp(rate) - FIXED_POINT_SCALE)) / FIXED_POINT_SCALE;
         return profit >= MIN_PROFIT ? profit : 0;
     }
 
