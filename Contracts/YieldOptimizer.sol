@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+a// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 // OpenZeppelin imports
@@ -14,7 +14,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 // PRBMath import
 import "@prb/math/PRBMathUD60x18.sol";
 
-// Interfaces
+// Interfaces (unchanged from first version)
 interface IAaveV3Pool {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
@@ -106,7 +106,6 @@ interface IStakingManager {
     function depositRewards(uint256 amount) external;
     function claimRewards() external;
     function earnPoints(address user, uint256 amount, bool isAllocation) external;
-    function claimPoints(address user) external;
 }
 
 interface IGovernanceManager {
@@ -117,6 +116,12 @@ interface IGovernanceManager {
 
 interface IUpkeepManager {
     function manualUpkeep(bool isRWA) external;
+}
+
+interface IGovernanceVault {
+    function getFeeDiscount(address user) external view returns (uint256);
+    function votingPower(address user) external view returns (uint256);
+    function distributeProfits(uint256 amount) external;
 }
 
 /**
@@ -144,9 +149,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     IStakingManager public stakingManager;
     IGovernanceManager public governanceManager;
     IUpkeepManager public upkeepManager;
+    IGovernanceVault public governanceVault; // Added for fee discounts
     address public feeRecipient;
-    uint256 public managementFee;
-    uint256 public performanceFee;
+    uint256 public managementFee; // Basis points (e.g., 50 = 0.5%)
+    uint256 public performanceFee; // Basis points (e.g., 1000 = 10%)
     uint256 public totalAllocated;
     uint256 public minRWALiquidityThreshold;
     bool public allowLeverage;
@@ -162,9 +168,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     uint256 private constant MAX_APY = 10000; // 100%
     uint256 private constant FIXED_POINT_SCALE = 1e18;
     uint256 private constant MAX_EXP_INPUT = 10e18;
-    uint256 private constant MIN_PROFIT = 1e6;
+    uint256 private constant MIN_PROFIT = 1e6; // 1 USDC
     uint256 private constant AAVE_REFERRAL_CODE = 0;
-    uint256 private constant MIN_ALLOCATION = 1e16;
+    uint256 private constant MIN_ALLOCATION = 1e16; // 0.01 USDC
     uint256 public immutable MIN_DEPOSIT;
 
     // Structs
@@ -186,8 +192,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     // Events
-    event Deposit(address indexed user, uint256 amount, uint256 fee);
-    event Withdraw(address indexed user, uint256 amount, uint256 fee);
+    event Deposit(address indexed user, uint256 amount, uint256 fee, uint256 discount);
+    event Withdraw(address indexed user, uint256 amount, uint256 fee, uint256 discount);
     event Rebalance(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged);
     event FeesCollected(uint256 managementFee, uint256 performanceFee);
     event FeeRecipientUpdated(address indexed newRecipient);
@@ -199,10 +205,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     event AIAllocationDetails(address[] protocols, uint256[] amounts, bool[] isLeveraged, string logicDescription);
     event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
     event PauseToggled(bool status);
+    event GovernanceVaultUpdated(address indexed newGovernanceVault);
 
     // Modifiers
     modifier onlyGovernance() {
-        require(msg.sender == governanceManager.governance(), "Not governance");
+        require(msg.sender == address(governanceManager), "Not governance");
         _;
     }
 
@@ -229,6 +236,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         address _stakingManager,
         address _governanceManager,
         address _upkeepManager,
+        address _governanceVault,
         address _feeRecipient
     ) external initializer {
         require(_stablecoin != address(0), "Invalid stablecoin address");
@@ -245,6 +253,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(_stakingManager != address(0), "Invalid StakingManager address");
         require(_governanceManager != address(0), "Invalid GovernanceManager address");
         require(_upkeepManager != address(0), "Invalid UpkeepManager address");
+        require(_governanceVault != address(0), "Invalid GovernanceVault address");
         require(_feeRecipient != address(0), "Invalid fee recipient");
 
         __Ownable_init(msg.sender);
@@ -266,6 +275,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         stakingManager = IStakingManager(_stakingManager);
         governanceManager = IGovernanceManager(_governanceManager);
         upkeepManager = IUpkeepManager(_upkeepManager);
+        governanceVault = IGovernanceVault(_governanceVault);
         feeRecipient = _feeRecipient;
         managementFee = 50; // 0.5%
         performanceFee = 1000; // 10%
@@ -280,14 +290,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /**
-     * @notice Deposits funds and allocates them to protocols with Sonic points tracking.
+     * @notice Deposits funds and allocates them to protocols with Sonic points tracking and fee discounts.
+     * @param amount Amount of USDC to deposit
+     * @param useLockup Whether to apply a lockup period for staking
+     * @param lockupDays Number of lockup days (e.g., 30 or 90)
      */
-    function deposit(uint256 amount) external nonReentrant whenNotPaused {
+    function deposit(uint256 amount, bool useLockup, uint256 lockupDays) external nonReentrant whenNotPaused {
         require(amount >= MIN_DEPOSIT, "Deposit below minimum");
         require(!blacklistedUsers[msg.sender], "User blacklisted");
         require(flyingTulip.isOFACCompliant(msg.sender), "OFAC check failed");
+        require(lockupDays == 0 || lockupDays == 30 || lockupDays == 90, "Invalid lockup period");
 
-        uint256 fee = (amount * managementFee) / BASIS_POINTS;
+        // Apply management fee with discount from GovernanceVault
+        uint256 discount = governanceVault.getFeeDiscount(msg.sender); // 0, 25, or 50 (%)
+        uint256 feeRate = (managementFee * (100 - discount)) / 100; // e.g., 50 * (100-25)/100 = 37.5 (0.375%)
+        uint256 fee = (amount * feeRate) / BASIS_POINTS;
         uint256 netAmount = amount - fee;
 
         stablecoin.safeTransferFrom(msg.sender, address(this), amount);
@@ -299,18 +316,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         _allocateFunds(netAmount);
 
-        emit Deposit(msg.sender, netAmount, fee);
+        emit Deposit(msg.sender, netAmount, fee, discount);
     }
 
     /**
-     * @notice Withdraws funds and distributes profits.
+     * @notice Withdraws funds and distributes profits with fee discounts.
+     * @param amount Amount of USDC to withdraw
      */
     function withdraw(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be > 0");
         require(userBalances[msg.sender] >= amount, "Insufficient balance");
 
         uint256 profit = _calculateProfit(msg.sender, amount);
-        uint256 performanceFeeAmount = (profit * performanceFee) / BASIS_POINTS;
+        uint256 discount = governanceVault.getFeeDiscount(msg.sender); // 0, 25, or 50 (%)
+        uint256 feeRate = (performanceFee * (100 - discount)) / 100; // e.g., 1000 * (100-25)/100 = 750 (7.5%)
+        uint256 performanceFeeAmount = (profit * feeRate) / BASIS_POINTS;
         uint256 netProfit = profit - performanceFeeAmount;
 
         userBalances[msg.sender] -= amount;
@@ -325,8 +345,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
         stablecoin.safeTransfer(msg.sender, amount + netProfit);
 
-        emit Withdraw(msg.sender, amount + netProfit, performanceFeeAmount);
-        emit FeesCollected(fee, performanceFeeAmount);
+        emit Withdraw(msg.sender, amount + netProfit, performanceFeeAmount, discount);
+        emit FeesCollected(feeRate, performanceFeeAmount);
     }
 
     /**
@@ -342,6 +362,16 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         stablecoin.safeTransfer(msg.sender, amount);
 
         emit UserEmergencyWithdraw(msg.sender, amount);
+    }
+
+    /**
+     * @notice Updates the GovernanceVault address.
+     * @param _governanceVault New GovernanceVault address
+     */
+    function setGovernanceVault(address _governanceVault) external onlyOwner {
+        require(_governanceVault != address(0), "Invalid GovernanceVault");
+        governanceVault = IGovernanceVault(_governanceVault);
+        emit GovernanceVaultUpdated(_governanceVault);
     }
 
     /**
@@ -456,7 +486,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             return flyingTulip.getDynamicAPY(protocol); // Simplified, assumes APY as LTV proxy
         } else if (protocol == address(aavePool)) {
             return aavePool.getReserveData(address(stablecoin)).liquidityIndex; // Simplified
-        } else if (registry.protocols(protocol).isCompound) {
+        } else if (registry.isValidProtocol(protocol) && compound.underlying() == protocol) {
             return 5000; // Default 50% LTV for Compound
         }
         return 0;
@@ -603,7 +633,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             } catch {
                 revert("Aave supply failed");
             }
-        } else if (registry.protocols(protocol).isCompound) {
+        } else if (registry.isValidProtocol(protocol) && compound.underlying() == protocol) {
             try compound.mint(amount) returns (uint256 err) {
                 require(err == 0, "Compound mint failed");
                 emit AIAllocationOptimized(protocol, amount, lastKnownAPYs[protocol], isLeveraged);
@@ -626,7 +656,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 ? flyingTulip.withdrawFromPool(protocol, amount)
                 : protocol == address(aavePool)
                     ? aavePool.withdraw(address(stablecoin), amount, address(this))
-                    : registry.protocols(protocol).isCompound
+                    : registry.isValidProtocol(protocol) && compound.underlying() == protocol
                         ? compound.redeemUnderlying(amount) == 0 ? amount : 0
                         : defiYield.withdrawFromDeFi(protocol, amount)
         returns (uint256 amountWithdrawn) {
@@ -677,7 +707,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                     ? flyingTulip.getAvailableLiquidity(protocol)
                     : protocol == address(aavePool)
                         ? IERC20(aavePool.getReserveData(address(stablecoin)).aTokenAddress).balanceOf(address(aavePool))
-                        : registry.protocols(protocol).isCompound
+                        : registry.isValidProtocol(protocol) && compound.underlying() == protocol
                             ? IERC20(compound.underlying()).balanceOf(protocol)
                             : defiYield.getAvailableLiquidity(protocol)
         returns (uint256 available) {
