@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// OpenZeppelin imports
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
@@ -10,8 +9,6 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
-
-// PRBMath import
 import "@prb/math/PRBMathUD60x18.sol";
 
 // Interfaces
@@ -51,10 +48,12 @@ interface IRWAYield {
 }
 
 interface IDeFiYield {
-    function depositToDeFi(address protocol, uint256 amount) external;
-    function withdrawFromDeFi(address protocol, uint256 amount) external returns (uint256);
+    function depositToDeFi(address protocol, uint256 amount, bytes32 correlationId) external;
+    function withdrawFromDeFi(address protocol, uint256 amount, bytes32 correlationId) external returns (uint256);
     function isDeFiProtocol(address protocol) external view returns (bool);
     function getAvailableLiquidity(address protocol) external view returns (uint256);
+    function getTotalDeFiBalance() external view returns (uint256);
+    function protocolScores(address protocol) external view returns (uint256 apy, uint256 tvl, uint256 riskScore, uint256 score);
 }
 
 interface IFlyingTulip {
@@ -137,8 +136,8 @@ interface IPointsTierManager {
 
 /**
  * @title YieldOptimizer
- * @notice A DeFi yield farming aggregator optimized for Sonic Blockchain, supporting Aave V3, Compound, FlyingTulip, and delegating RWA allocations to AIYieldOptimizer.
- * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points, PointsTierManager, and modular contracts.
+ * @notice DeFi yield farming aggregator for Sonic Blockchain, integrating with DeFiYield and AIYieldOptimizer.
+ * @dev Uses UUPS proxy, supports Sonic Points, and includes optimized rebalancing.
  */
 contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -163,8 +162,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     IGovernanceVault public governanceVault;
     IPointsTierManager public pointsTierManager;
     address public feeRecipient;
-    uint256 public managementFee; // Basis points (e.g., 50 = 0.5%)
-    uint256 public performanceFee; // Basis points (e.g., 1000 = 10%)
+    uint256 public managementFee; // Basis points
+    uint256 public performanceFee; // Basis points
     uint256 public totalAllocated;
     uint256 public minRWALiquidityThreshold;
     bool public allowLeverage;
@@ -185,7 +184,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     uint256 private constant AAVE_REFERRAL_CODE = 0;
     uint256 private constant MIN_ALLOCATION = 1e16; // 0.01 USDC
     uint256 public immutable MIN_DEPOSIT;
-    uint256 private constant MAX_LOCKUPS = 10; // Limit to prevent gas issues
+    uint256 private constant MAX_LOCKUPS = 10;
 
     // Structs
     struct Allocation {
@@ -206,24 +205,24 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     struct Lockup {
-        uint256 amount; // Amount locked
-        uint256 lockupDays; // Lockup period in days
-        uint256 startTimestamp; // When lockup started
+        uint256 amount;
+        uint256 lockupDays;
+        uint256 startTimestamp;
     }
 
     // Events
-    event Deposit(address indexed user, uint256 amount, uint256 fee, uint256 discount);
-    event Withdraw(address indexed user, uint256 amount, uint256 fee, uint256 discount);
-    event Rebalance(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged);
-    event FeesCollected(uint256 managementFee, uint256 performanceFee);
+    event Deposit(address indexed user, uint256 amount, uint256 fee, uint256 discount, bytes32 indexed correlationId);
+    event Withdraw(address indexed user, uint256 amount, uint256 fee, uint256 discount, bytes32 indexed correlationId);
+    event Rebalance(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged, bytes32 indexed correlationId);
+    event FeesCollected(uint256 managementFee, uint256 performanceFee, bytes32 indexed correlationId);
     event FeeRecipientUpdated(address indexed newRecipient);
     event FeesUpdated(uint256 managementFee, uint256 performanceFee);
     event BlacklistUpdated(address indexed user, bool status);
     event OFACCheckFailed(address indexed user);
-    event UserEmergencyWithdraw(address indexed user, uint256 amount);
-    event AIAllocationOptimized(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged);
-    event AIAllocationDetails(address[] protocols, uint256[] amounts, bool[] isLeveraged, string logicDescription);
-    event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
+    event UserEmergencyWithdraw(address indexed user, uint256 amount, bytes32 indexed correlationId);
+    event AIAllocationOptimized(address indexed protocol, uint256 amount, uint256 apy, bool isLeveraged, bytes32 indexed correlationId);
+    event AIAllocationDetails(address[] protocols, uint256[] amounts, bool[] isLeveraged, string logicDescription, bytes32 indexed correlationId);
+    event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount, bytes32 indexed correlationId);
     event PauseToggled(bool status);
     event GovernanceVaultUpdated(address indexed newGovernanceVault);
     event LockupCreated(address indexed user, uint256 amount, uint256 lockupDays, uint256 startTimestamp);
@@ -242,7 +241,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Initializes the contract with Sonic-specific parameters and modular integrations.
+     * @notice Initializes the contract.
      */
     function initialize(
         address _stablecoin,
@@ -311,15 +310,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Authorizes contract upgrades.
+     * @notice Authorizes upgrades.
      */
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /**
-     * @notice Deposits funds, allocates them to protocols, tracks lockups, and awards Sonic Points with aggregated tier multipliers.
-     * @param amount Amount of USDC to deposit
-     * @param useLockup Whether to apply a lockup period for staking
-     * @param lockupDays Number of lockup days (e.g., 30 or 90)
+     * @notice Deposits funds and allocates them.
      */
     function deposit(uint256 amount, bool useLockup, uint256 lockupDays) external nonReentrant whenNotPaused {
         require(amount >= MIN_DEPOSIT, "Deposit below minimum");
@@ -327,16 +323,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(flyingTulip.isOFACCompliant(msg.sender), "OFAC check failed");
         require(lockupDays == 0 || lockupDays == 30 || lockupDays == 90, "Invalid lockup period");
 
-        // Apply management fee with discount from GovernanceVault
-        uint256 discount = governanceVault.getFeeDiscount(msg.sender); // 0, 25, or 50 (%)
-        uint256 feeRate = (managementFee * (100 - discount)) / 100; // e.g., 50 * (100-25)/100 = 37.5 (0.375%)
+        bytes32 correlationId = keccak256(abi.encodePacked(msg.sender, block.timestamp, amount));
+        uint256 discount = governanceVault.getFeeDiscount(msg.sender);
+        uint256 feeRate = (managementFee * (100 - discount)) / 100;
         uint256 fee = (amount * feeRate) / BASIS_POINTS;
         uint256 netAmount = amount - fee;
 
         stablecoin.safeTransferFrom(msg.sender, address(this), amount);
         stablecoin.safeTransfer(feeRecipient, fee);
 
-        // Track lockup if applicable
         if (useLockup && lockupDays > 0) {
             Lockup[] storage lockups = userLockups[msg.sender];
             require(lockups.length < MAX_LOCKUPS, "Max lockups reached");
@@ -351,46 +346,44 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         userBalances[msg.sender] += netAmount;
         totalAllocated += netAmount;
 
-        // Calculate aggregated lockup status for tiering
         (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
         stakingManager.awardPoints(msg.sender, netAmount, true, hasLockup, maxLockupDays);
         emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
 
-        _allocateFunds(netAmount);
+        _allocateFunds(netAmount, 0, type(uint256).max, correlationId);
 
-        emit Deposit(msg.sender, netAmount, fee, discount);
+        emit Deposit(msg.sender, netAmount, fee, discount, correlationId);
+
+        // Testing Note: Test fee discounts, lockup limits, and point awards.
     }
 
     /**
-     * @notice Withdraws funds, enforces lockup restrictions, and distributes profits with fee discounts.
-     * @param amount Amount of USDC to withdraw
+     * @notice Withdraws funds with profits.
      */
     function withdraw(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be > 0");
         require(userBalances[msg.sender] >= amount, "Insufficient balance");
 
-        // Check available unlocked balance
+        bytes32 correlationId = keccak256(abi.encodePacked(msg.sender, block.timestamp, amount));
         uint256 unlockedBalance = getUnlockedBalance(msg.sender);
         require(unlockedBalance >= amount, "Locked funds");
 
         uint256 profit = _calculateProfit(msg.sender, amount);
-        uint256 discount = governanceVault.getFeeDiscount(msg.sender); // 0, 25, or 50 (%)
-        uint256 feeRate = (performanceFee * (100 - discount)) / 100; // e.g., 1000 * (100-25)/100 = 750 (7.5%)
+        uint256 discount = governanceVault.getFeeDiscount(msg.sender);
+        uint256 feeRate = (performanceFee * (100 - discount)) / 100;
         uint256 performanceFeeAmount = (profit * feeRate) / BASIS_POINTS;
         uint256 netProfit = profit - performanceFeeAmount;
 
-        // Update lockups by reducing amounts or removing expired ones
         _updateLockups(msg.sender, amount);
 
         userBalances[msg.sender] -= amount;
         totalAllocated -= amount;
 
-        // Update tier after withdrawal
         (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
         stakingManager.awardPoints(msg.sender, amount, false, hasLockup, maxLockupDays);
         emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
 
-        uint256 withdrawnAmount = _deallocateFunds(amount);
+        uint256 withdrawnAmount = _deallocateFunds(amount, correlationId);
         require(withdrawnAmount >= amount, "Insufficient funds withdrawn");
 
         if (performanceFeeAmount > 0) {
@@ -398,35 +391,37 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
         stablecoin.safeTransfer(msg.sender, amount + netProfit);
 
-        emit Withdraw(msg.sender, amount + netProfit, performanceFeeAmount, discount);
-        emit FeesCollected(feeRate, performanceFeeAmount);
+        emit Withdraw(msg.sender, amount + netProfit, performanceFeeAmount, discount, correlationId);
+        emit FeesCollected(feeRate, performanceFeeAmount, correlationId);
+
+        // Testing Note: Test profit calculations, lockup enforcement, and fee application.
     }
 
     /**
-     * @notice Allows users to withdraw funds during an emergency pause.
+     * @notice Emergency withdraw during pause.
      */
     function userEmergencyWithdraw(uint256 amount) external nonReentrant {
         require(isPaused, "Not paused");
         require(amount > 0, "Amount must be > 0");
         require(userBalances[msg.sender] >= amount, "Insufficient balance");
 
+        bytes32 correlationId = keccak256(abi.encodePacked(msg.sender, block.timestamp, amount));
         userBalances[msg.sender] -= amount;
         totalAllocated -= amount;
         stablecoin.safeTransfer(msg.sender, amount);
 
-        // Clear lockups during emergency (no restrictions)
         delete userLockups[msg.sender];
 
-        // Update tier to reflect zero balance
         stakingManager.awardPoints(msg.sender, amount, false, false, 0);
         emit TierUpdated(msg.sender, 0, false, 0);
 
-        emit UserEmergencyWithdraw(msg.sender, amount);
+        emit UserEmergencyWithdraw(msg.sender, amount, correlationId);
+
+        // Testing Note: Test emergency withdrawals during pause and lockup clearing.
     }
 
     /**
-     * @notice Updates the GovernanceVault address.
-     * @param _governanceVault New GovernanceVault address
+     * @notice Updates GovernanceVault.
      */
     function setGovernanceVault(address _governanceVault) external onlyOwner {
         require(_governanceVault != address(0), "Invalid GovernanceVault");
@@ -435,8 +430,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Updates the PointsTierManager address.
-     * @param _pointsTierManager New PointsTierManager address
+     * @notice Updates PointsTierManager.
      */
     function setPointsTierManager(address _pointsTierManager) external onlyOwner {
         require(_pointsTierManager != address(0), "Invalid PointsTierManager");
@@ -445,9 +439,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Calculates the unlocked balance for a user.
-     * @param user User address
-     * @return Unlocked balance (funds available for withdrawal)
+     * @notice Calculates unlocked balance.
      */
     function getUnlockedBalance(address user) public view returns (uint256) {
         uint256 totalBalance = userBalances[user];
@@ -464,15 +456,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Updates lockups by reducing amounts or removing expired ones.
-     * @param user User address
-     * @param withdrawAmount Amount to withdraw
+     * @notice Updates lockups.
      */
     function _updateLockups(address user, uint256 withdrawAmount) internal {
         Lockup[] storage lockups = userLockups[user];
         uint256 remaining = withdrawAmount;
 
-        // First, try to deduct from unlocked (expired) lockups
         for (uint256 i = 0; i < lockups.length && remaining > 0; i++) {
             if (block.timestamp >= lockups[i].startTimestamp + (lockups[i].lockupDays * 1 days)) {
                 uint256 deduct = remaining >= lockups[i].amount ? lockups[i].amount : remaining;
@@ -481,10 +470,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             }
         }
 
-        // If still remaining, deduct from non-locked balance (implicitly handled by getUnlockedBalance)
         require(remaining == 0, "Locked funds");
 
-        // Clean up zero-amount or expired lockups
         uint256 writeIndex = 0;
         for (uint256 i = 0; i < lockups.length; i++) {
             if (lockups[i].amount > 0) {
@@ -498,19 +485,14 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Gets a user’s lockup details.
-     * @param user User address
-     * @return Array of Lockup structs
+     * @notice Gets user lockups.
      */
     function getUserLockups(address user) external view returns (Lockup[] memory) {
         return userLockups[user];
     }
 
     /**
-     * @notice Gets a user’s aggregated lockup status for tiering.
-     * @param user User address
-     * @return hasLockup True if any active lockup exists
-     * @return maxLockupDays Longest active lockup period
+     * @notice Gets lockup status.
      */
     function getUserLockupStatus(address user) public view returns (bool hasLockup, uint256 maxLockupDays) {
         Lockup[] storage lockups = userLockups[user];
@@ -528,36 +510,43 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice AI-driven rebalance with risk-adjusted allocations and Sonic compliance.
+     * @notice Rebalances portfolio with pagination.
      */
-    function rebalance() external onlyGovernance nonReentrant whenNotPaused {
+    function rebalance(uint256 start, uint256 limit, bytes32 correlationId)
+        external
+        onlyGovernance
+        nonReentrant
+        whenNotPaused
+    {
         address[] memory protocols = registry.getActiveProtocols(false);
-        uint256[] memory apys = new uint256[](protocols.length);
+        require(start < protocols.length, "Invalid start index");
+        uint256 end = start.add(limit) > protocols.length ? protocols.length : start.add(limit);
 
         // Withdraw from non-RWA protocols
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = start; i < end; i++) {
             Allocation storage alloc = allocations[protocols[i]];
             if (alloc.amount > 0) {
-                uint256 withdrawn = _withdrawFromProtocol(protocols[i], alloc.amount);
+                uint256 withdrawn = _withdrawFromProtocol(protocols[i], alloc.amount, correlationId);
                 alloc.amount -= withdrawn;
             }
         }
         _cleanAllocations();
 
         // Fetch APYs and risk scores
-        for (uint256 i = 0; i < protocols.length; i++) {
-            apys[i] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
+        uint256[] memory apys = new uint256[](end - start);
+        for (uint256 i = start; i < end; i++) {
+            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
         }
 
         uint256 totalBalance = stablecoin.balanceOf(address(this)) + aiYieldOptimizer.getTotalRWABalance();
         uint256 totalWeightedAPY = 0;
         uint256 nonRWAAmount = 0;
-        uint256[] memory weights = new uint256[](protocols.length);
+        uint256[] memory weights = new uint256[](end - start);
 
-        // Calculate weights for non-RWA protocols
-        for (uint256 i = 0; i < protocols.length; i++) {
-            if (!registry.isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) {
-                emit AIAllocationOptimized(protocols[i], 0, apys[i], false);
+        // Calculate weights
+        for (uint256 i = 0; i < end - start; i++) {
+            if (!registry.isValidProtocol(protocols[start + i]) || !_validateAPY(apys[i], protocols[start + i])) {
+                emit AIAllocationOptimized(protocols[start + i], 0, apys[i], false, correlationId);
                 continue;
             }
             weights[i] = apys[i];
@@ -565,24 +554,24 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
 
         // Allocate to non-RWA protocols
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = 0; i < end - start; i++) {
             if (weights[i] == 0) continue;
             uint256 allocAmount = (totalBalance * weights[i]) / (totalWeightedAPY == 0 ? 1 : totalWeightedAPY);
             if (allocAmount < MIN_ALLOCATION) {
-                emit AIAllocationOptimized(protocols[i], 0, apys[i], false);
+                emit AIAllocationOptimized(protocols[start + i], 0, apys[i], false, correlationId);
                 continue;
             }
-            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[i], allocAmount);
-            allocations[protocols[i]] = Allocation(protocols[i], allocAmount, apys[i], block.timestamp, isLeveraged);
-            lastKnownAPYs[protocols[i]] = apys[i];
-            _depositToProtocol(protocols[i], allocAmount, isLeveraged);
+            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[start + i], allocAmount);
+            allocations[protocols[start + i]] = Allocation(protocols[start + i], allocAmount, apys[i], block.timestamp, isLeveraged);
+            lastKnownAPYs[protocols[start + i]] = apys[i];
+            _depositToProtocol(protocols[start + i], allocAmount, isLeveraged, correlationId);
             nonRWAAmount += allocAmount;
             if (isLeveraged) {
-                uint256 ltv = _getLTV(protocols[i], allocAmount);
-                looperCore.applyLeverage(protocols[i], allocAmount, ltv, false);
+                uint256 ltv = _getLTV(protocols[start + i], allocAmount);
+                looperCore.applyLeverage(protocols[start + i], allocAmount, ltv, false);
             }
-            emit AIAllocationOptimized(protocols[i], allocAmount, apys[i], isLeveraged);
-            emit Rebalance(protocols[i], allocAmount, apys[i], isLeveraged);
+            emit AIAllocationOptimized(protocols[start + i], allocAmount, apys[i], isLeveraged, correlationId);
+            emit Rebalance(protocols[start + i], allocAmount, apys[i], isLeveraged, correlationId);
         }
 
         // Delegate RWA reallocation
@@ -596,35 +585,42 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
             aiYieldOptimizer.rebalancePortfolio(rwaProtocols, amounts, isLeveraged);
             string memory logicDescription = aiYieldOptimizer.getAllocationLogic(rwaAmount);
-            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription);
-            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
+            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription, correlationId);
+            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount, correlationId);
         }
+
+        // Testing Note: Test pagination, partial rebalancing, and RWA delegation failures.
     }
 
     /**
-     * @notice Validates AI-driven allocations to ensure correctness.
+     * @notice Validates AI allocations.
      */
-    function validateAIAllocations(address[] memory protocols, uint256[] memory amounts, uint256 totalAmount) internal view returns (bool) {
+    function validateAIAllocations(address[] memory protocols, uint256[] memory amounts, uint256 totalAmount)
+        internal
+        view
+        returns (bool)
+    {
         if (protocols.length != amounts.length) return false;
         uint256 sum = 0;
         for (uint256 i = 0; i < protocols.length; i++) {
             if (!rwaYield.isRWA(protocols[i]) || !validateRWAProtocol(protocols[i])) return false;
             sum += amounts[i];
         }
-        return sum <= totalAmount && sum >= totalAmount * 95 / 100; // Allow 5% tolerance
+        return sum <= totalAmount && sum >= totalAmount * 95 / 100;
     }
 
     /**
-     * @notice Validates RWA protocol liquidity and vetting.
+     * @notice Validates RWA protocol.
      */
     function validateRWAProtocol(address protocol) internal view returns (bool) {
-        return rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold &&
-               registry.isValidProtocol(protocol) &&
-               sonicProtocol.isSonicCompliant(protocol);
+        return
+            rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold &&
+            registry.isValidProtocol(protocol) &&
+            sonicProtocol.isSonicCompliant(protocol);
     }
 
     /**
-     * @notice Assesses leverage viability using RiskManager.
+     * @notice Assesses leverage viability.
      */
     function _assessLeverageViability(address protocol, uint256 amount) internal view returns (bool) {
         uint256 ltv = _getLTV(protocol, amount);
@@ -632,21 +628,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Gets LTV for a protocol.
+     * @notice Gets LTV.
      */
     function _getLTV(address protocol, uint256 amount) internal view returns (uint256) {
         if (protocol == address(flyingTulip)) {
-            return flyingTulip.getDynamicAPY(protocol); // Simplified, assumes APY as LTV proxy
+            return flyingTulip.getDynamicAPY(protocol);
         } else if (protocol == address(aavePool)) {
-            return aavePool.getReserveData(address(stablecoin)).liquidityIndex; // Simplified
+            return aavePool.getReserveData(address(stablecoin)).liquidityIndex;
         } else if (registry.isValidProtocol(protocol) && compound.underlying() == protocol) {
-            return 5000; // Default 50% LTV for Compound
+            return 5000; // 50% LTV
         }
         return 0;
     }
 
     /**
-     * @notice Toggles emergency pause.
+     * @notice Toggles pause.
      */
     function pause() external onlyGovernance {
         isPaused = true;
@@ -654,7 +650,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Unpauses the contract.
+     * @notice Unpauses contract.
      */
     function unpause() external onlyGovernance {
         isPaused = false;
@@ -662,7 +658,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Updates user blacklist status.
+     * @notice Updates blacklist.
      */
     function updateBlacklist(address user, bool status) external onlyGovernance {
         blacklistedUsers[user] = status;
@@ -670,46 +666,49 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Manual upkeep for non-RWA protocols.
+     * @notice Manual upkeep.
      */
     function manualUpkeep() external onlyGovernance {
         upkeepManager.manualUpkeep(false);
     }
 
     /**
-     * @notice Allocates funds to protocols, delegating RWA allocations to AIYieldOptimizer.
+     * @notice Allocates funds with pagination.
      */
-    function _allocateFunds(uint256 amount) internal {
+    function _allocateFunds(uint256 amount, uint256 start, uint256 limit, bytes32 correlationId) internal {
         address[] memory protocols = registry.getActiveProtocols(false);
-        uint256[] memory apys = new uint256[](protocols.length);
-        for (uint256 i = 0; i < protocols.length; i++) {
-            apys[i] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
+        require(start < protocols.length, "Invalid start index");
+        uint256 end = start.add(limit) > protocols.length ? protocols.length : start.add(limit);
+
+        uint256[] memory apys = new uint256[](end - start);
+        for (uint256 i = start; i < end; i++) {
+            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
         }
 
         uint256 totalWeightedAPY = 0;
         uint256 nonRWAAmount = 0;
-        uint256[] memory weights = new uint256[](protocols.length);
+        uint256[] memory weights = new uint256[](end - start);
 
-        for (uint256 i = 0; i < protocols.length; i++) {
-            if (!registry.isValidProtocol(protocols[i]) || !_validateAPY(apys[i], protocols[i])) continue;
+        for (uint256 i = 0; i < end - start; i++) {
+            if (!registry.isValidProtocol(protocols[start + i]) || !_validateAPY(apys[i], protocols[start + i])) continue;
             weights[i] = apys[i];
             totalWeightedAPY += apys[i];
         }
 
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = 0; i < end - start; i++) {
             if (weights[i] == 0) continue;
             uint256 allocAmount = (amount * weights[i]) / (totalWeightedAPY == 0 ? 1 : totalWeightedAPY);
             if (allocAmount < MIN_ALLOCATION) continue;
-            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[i], allocAmount);
-            allocations[protocols[i]] = Allocation(protocols[i], allocAmount, apys[i], block.timestamp, isLeveraged);
-            lastKnownAPYs[protocols[i]] = apys[i];
-            _depositToProtocol(protocols[i], allocAmount, isLeveraged);
+            bool isLeveraged = allowLeverage && _assessLeverageViability(protocols[start + i], allocAmount);
+            allocations[protocols[start + i]] = Allocation(protocols[start + i], allocAmount, apys[i], block.timestamp, isLeveraged);
+            lastKnownAPYs[protocols[start + i]] = apys[i];
+            _depositToProtocol(protocols[start + i], allocAmount, isLeveraged, correlationId);
             nonRWAAmount += allocAmount;
             if (isLeveraged) {
-                uint256 ltv = _getLTV(protocols[i], allocAmount);
-                looperCore.applyLeverage(protocols[i], allocAmount, ltv, false);
+                uint256 ltv = _getLTV(protocols[start + i], allocAmount);
+                looperCore.applyLeverage(protocols[start + i], allocAmount, ltv, false);
             }
-            emit AIAllocationOptimized(protocols[i], allocAmount, apys[i], isLeveraged);
+            emit AIAllocationOptimized(protocols[start + i], allocAmount, apys[i], isLeveraged, correlationId);
         }
 
         uint256 rwaAmount = amount > nonRWAAmount ? amount - nonRWAAmount : 0;
@@ -722,20 +721,21 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             stablecoin.safeTransfer(address(aiYieldOptimizer), rwaAmount);
             aiYieldOptimizer.submitAIAllocation(rwaProtocols, amounts, isLeveraged);
             string memory logicDescription = aiYieldOptimizer.getAllocationLogic(rwaAmount);
-            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription);
-            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
+            emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription, correlationId);
+            emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount, correlationId);
         }
+
+        // Testing Note: Test pagination, allocation failures, and RWA delegation.
     }
 
     /**
-     * @notice Deallocates funds from protocols with Sonic points tracking.
+     * @notice Deallocates funds.
      */
-    function _deallocateFunds(uint256 amount) internal returns (uint256) {
+    function _deallocateFunds(uint256 amount, bytes32 correlationId) internal returns (uint256) {
         uint256 totalWithdrawn = 0;
         address[] memory protocols = registry.getActiveProtocols(false);
         address[] memory rwaProtocols = aiYieldOptimizer.getSupportedProtocols();
 
-        // Withdraw from RWA protocols
         uint256 rwaBalance = aiYieldOptimizer.getTotalRWABalance();
         if (rwaBalance > 0) {
             uint256 rwaWithdrawAmount = (amount * rwaBalance) / (totalAllocated == 0 ? 1 : totalAllocated);
@@ -749,12 +749,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                     stakingManager.awardPoints(msg.sender, withdrawn, false, hasLockup, maxLockupDays);
                     emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
                 } catch {
-                    emit AIAllocationOptimized(protocol, 0, 0, false);
+                    emit AIAllocationOptimized(protocol, 0, 0, false, correlationId);
                 }
             }
         }
 
-        // Withdraw from non-RWA protocols
         for (uint256 i = 0; i < protocols.length && totalWithdrawn < amount; i++) {
             address protocol = protocols[i];
             Allocation storage alloc = allocations[protocol];
@@ -762,7 +761,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             if (withdrawAmount > 0) {
                 uint256 availableLiquidity = getProtocolLiquidity(protocol);
                 withdrawAmount = withdrawAmount > availableLiquidity ? availableLiquidity : withdrawAmount;
-                uint256 withdrawn = _withdrawFromProtocol(protocol, withdrawAmount);
+                uint256 withdrawn = _withdrawFromProtocol(protocol, withdrawAmount, correlationId);
                 alloc.amount -= withdrawn;
                 totalWithdrawn += withdrawn;
                 (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
@@ -772,38 +771,50 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
         _cleanAllocations();
         return totalWithdrawn;
+
+                // Testing Note: Test partial withdrawals, protocol failures, and point updates.
     }
 
     /**
      * @notice Deposits funds to a protocol.
+     * @param protocol Protocol address
+     * @param amount Amount to deposit
+     * @param isLeveraged Whether to apply leverage
+     * @param correlationId Unique ID for event tracing
      */
-    function _depositToProtocol(address protocol, uint256 amount, bool isLeveraged) internal {
+    function _depositToProtocol(address protocol, uint256 amount, bool isLeveraged, bytes32 correlationId) internal {
         stablecoin.safeApprove(protocol, 0);
         stablecoin.safeApprove(protocol, amount);
         if (protocol == address(flyingTulip)) {
             flyingTulip.depositToPool(protocol, amount, isLeveraged);
         } else if (protocol == address(aavePool)) {
             try aavePool.supply(address(stablecoin), amount, address(this), AAVE_REFERRAL_CODE) {
-                emit AIAllocationOptimized(protocol, amount, lastKnownAPYs[protocol], isLeveraged);
+                emit AIAllocationOptimized(protocol, amount, lastKnownAPYs[protocol], isLeveraged, correlationId);
             } catch {
                 revert("Aave supply failed");
             }
         } else if (registry.isValidProtocol(protocol) && compound.underlying() == protocol) {
             try compound.mint(amount) returns (uint256 err) {
                 require(err == 0, "Compound mint failed");
-                emit AIAllocationOptimized(protocol, amount, lastKnownAPYs[protocol], isLeveraged);
+                emit AIAllocationOptimized(protocol, amount, lastKnownAPYs[protocol], isLeveraged, correlationId);
             } catch {
                 revert("Compound mint failed");
             }
         } else {
-            defiYield.depositToDeFi(protocol, amount);
+            defiYield.depositToDeFi(protocol, amount, correlationId);
         }
+
+        // Testing Note: Test deposits to each protocol type, handling of failed deposits, and correlation ID propagation.
     }
 
     /**
      * @notice Withdraws funds from a protocol.
+     * @param protocol Protocol address
+     * @param amount Amount to withdraw
+     * @param correlationId Unique ID for event tracing
+     * @return withdrawn Amount withdrawn
      */
-    function _withdrawFromProtocol(address protocol, uint256 amount) internal returns (uint256) {
+    function _withdrawFromProtocol(address protocol, uint256 amount, bytes32 correlationId) internal returns (uint256) {
         uint256 balanceBefore = stablecoin.balanceOf(address(this));
         uint256 withdrawn = 0;
         try
@@ -813,14 +824,16 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                     ? aavePool.withdraw(address(stablecoin), amount, address(this))
                     : registry.isValidProtocol(protocol) && compound.underlying() == protocol
                         ? compound.redeemUnderlying(amount) == 0 ? amount : 0
-                        : defiYield.withdrawFromDeFi(protocol, amount)
+                        : defiYield.withdrawFromDeFi(protocol, amount, correlationId)
         returns (uint256 amountWithdrawn) {
             withdrawn = amountWithdrawn;
         } catch {
-            emit AIAllocationOptimized(protocol, 0, 0, false);
+            emit AIAllocationOptimized(protocol, 0, 0, false, correlationId);
         }
         require(stablecoin.balanceOf(address(this)) >= balanceBefore + withdrawn, "Withdrawal balance mismatch");
         return withdrawn;
+
+        // Testing Note: Test withdrawals from each protocol, failure handling, and balance mismatches.
     }
 
     /**
@@ -833,17 +846,24 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 delete allocations[protocols[i]];
             }
         }
+
+        // Testing Note: Test allocation cleanup with multiple zero-amount protocols.
     }
 
     /**
-     * @notice Validates a protocol for allocation.
+     * @notice Validates a protocol.
+     * @param protocol Protocol address
+     * @return True if valid
      */
     function _isValidProtocol(address protocol) internal view returns (bool) {
         return registry.isValidProtocol(protocol) && sonicProtocol.isSonicCompliant(protocol);
     }
 
     /**
-     * @notice Validates APY data for a protocol.
+     * @notice Validates APY data.
+     * @param apy APY value
+     * @param protocol Protocol address
+     * @return True if valid
      */
     function _validateAPY(uint256 apy, address protocol) internal view returns (bool) {
         uint256 liquidity = getProtocolLiquidity(protocol);
@@ -851,7 +871,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Gets the actual liquidity available in a protocol.
+     * @notice Gets protocol liquidity.
+     * @param protocol Protocol address
+     * @return liquidity Available liquidity
      */
     function getProtocolLiquidity(address protocol) public view returns (uint256 liquidity) {
         require(_isValidProtocol(protocol), "Invalid protocol");
@@ -870,10 +892,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         } catch {
             return 0;
         }
+
+        // Testing Note: Test liquidity queries for each protocol and failure cases.
     }
 
     /**
-     * @notice Calculates user profit with PRBMath for compound interest.
+     * @notice Calculates user profit with real-time DeFiYield data.
+     * @param user User address
+     * @param amount Amount to calculate profit for
+     * @return profit Estimated profit
      */
     function _calculateProfit(address user, uint256 amount) internal view returns (uint256) {
         uint256 userBalance = userBalances[user];
@@ -887,11 +914,19 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         for (uint256 i = 0; i < protocols.length; i++) {
             Allocation memory alloc = allocations[protocols[i]];
-            if (alloc.amount == 0 || alloc.apy == 0) continue;
+            if (alloc.amount == 0) continue;
+            
+            // Sync APY with DeFiYield for non-RWA protocols
+            uint256 apy = alloc.apy;
+            if (!rwaYield.isRWA(protocols[i]) && defiYield.isDeFiProtocol(protocols[i])) {
+                (uint256 protocolAPY,,,) = defiYield.protocolScores(protocols[i]);
+                apy = protocolAPY > 0 ? protocolAPY : alloc.apy;
+            }
+
             uint256 timeElapsed = block.timestamp - alloc.lastUpdated;
             if (timeElapsed == 0) continue;
 
-            uint256 apyScaled = (alloc.apy * FIXED_POINT_SCALE) / BASIS_POINTS;
+            uint256 apyScaled = (apy * FIXED_POINT_SCALE) / BASIS_POINTS;
             uint256 ratePerSecond = apyScaled / SECONDS_PER_YEAR;
             uint256 exponent = ratePerSecond * timeElapsed;
             if (exponent > MAX_EXP_INPUT) continue;
@@ -912,18 +947,26 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
 
         return totalProfit >= MIN_PROFIT ? totalProfit : 0;
+
+        // Testing Note: Test profit calculations with real-time DeFiYield APYs, zero APYs, and large time intervals.
     }
 
     /**
-     * @notice Gets user balance with estimated profits.
+     * @notice Gets user balance and estimated profits.
+     * @param user User address
+     * @return balance User balance
+     * @return estimatedProfit Estimated profit
      */
     function getUserBalance(address user) external view returns (uint256 balance, uint256 estimatedProfit) {
         balance = userBalances[user];
         estimatedProfit = _calculateProfit(user, balance);
+
+        // Testing Note: Test balance and profit calculations for users with no allocations or lockups.
     }
 
     /**
-     * @notice Gets detailed allocation breakdown for transparency.
+     * @notice Gets allocation breakdown.
+     * @return breakdown Detailed allocation data
      */
     function getAllocationBreakdown() external view returns (AllocationBreakdown[] memory) {
         address[] memory protocols = registry.getActiveProtocols(false);
@@ -964,12 +1007,18 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
 
         return finalBreakdown;
+
+        // Testing Note: Test breakdown accuracy with zero allocations and RWA balances.
     }
 
     /**
-     * @notice Fallback function to prevent accidental ETH deposits.
+     * @notice Prevents accidental ETH deposits.
      */
     receive() external payable {
         revert("ETH deposits not allowed");
+
+        // Testing Note: Test fallback function with ETH transfers.
     }
 }
+
+   
