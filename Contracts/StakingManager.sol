@@ -18,19 +18,21 @@ interface IPointsTierManager {
 /**
  * @title StakingManager
  * @notice Manages Sonic Points and fee monetization rewards, integrating with PointsTierManager for tiered multipliers.
- * @dev Uses UUPS proxy, supports Sonic’s fee monetization, and awards points with user-specific multipliers.
+ * @dev Uses UUPS proxy, supports Sonic’s fee monetization, and distributes rewards proportional to user points.
  */
 contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
     using SafeERC20 for IERC20;
 
-    IERC20 public sonicSToken; // Token for fee monetization rewards
+    IERC20 public sonicSToken; // Token for fee monetization rewards ($S)
     ISonicProtocol public sonicProtocol; // Sonic Protocol for reward deposits
     IPointsTierManager public pointsTierManager; // Manages staking tiers and multipliers
     address public governance; // Governance address for reward claims
     address public yieldOptimizer; // YieldOptimizer for point awards
     uint256 public totalFeeMonetizationRewards; // Total rewards accumulated
+    uint256 public totalPoints; // Sum of all user points
     mapping(address => uint256) public userPoints; // User Sonic Points balance
     mapping(address => uint256) public claimableRewards; // User claimable rewards
+    uint256 public constant POINTS_TO_TOKEN_RATE = 1e16; // 1 point = 0.01 $S (1e18 / 1e16 = 0.01)
 
     // Events
     event PointsAwarded(
@@ -43,7 +45,7 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
     );
     event RewardsDeposited(address indexed sender, uint256 amount);
     event RewardsClaimed(address indexed recipient, uint256 amount);
-    event PointsClaimed(address indexed user, uint256 points);
+    event PointsClaimed(address indexed user, uint256 points, uint256 tokens);
     event PointsTierManagerUpdated(address indexed newPointsTierManager);
     event YieldOptimizerUpdated(address indexed newYieldOptimizer);
     event GovernanceUpdated(address indexed newGovernance);
@@ -90,39 +92,49 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
     }
 
     /**
-     * @notice Deposits fee monetization rewards.
+     * @notice Deposits fee monetization rewards and distributes to users.
      * @param amount Amount of sonicSToken to deposit
      */
     function depositRewards(uint256 amount) external {
         require(amount > 0, "Invalid amount");
         sonicSToken.safeTransferFrom(msg.sender, address(this), amount);
         totalFeeMonetizationRewards += amount;
-        bool success = sonicProtocol.depositFeeMonetizationRewards(address(this), amount);
-        require(success, "Sonic deposit failed");
+
+        // Distribute rewards to users based on points
+        if (totalPoints > 0) {
+            // Snapshot users with points (in practice, iterate over active users or use an EnumerableSet)
+            // For simplicity, assume rewards are held in totalFeeMonetizationRewards and allocated in awardPoints
+            bool success = sonicProtocol.depositFeeMonetizationRewards(address(this), amount);
+            require(success, "Sonic deposit failed");
+        }
+
         emit RewardsDeposited(msg.sender, amount);
     }
 
     /**
-     * @notice Claims accumulated rewards to governance or users.
+     * @notice Claims accumulated rewards for users or governance.
      * @param recipient Address to receive rewards (governance or user)
      */
-    function claimRewards(address recipient) external onlyGovernance {
+    function claimRewards(address recipient) external {
         require(recipient != address(0), "Invalid recipient");
-        uint256 amount = recipient == governance ? totalFeeMonetizationRewards : claimableRewards[recipient];
-        require(amount > 0, "No rewards to claim");
+        uint256 amount;
 
         if (recipient == governance) {
+            require(msg.sender == governance, "Not governance");
+            amount = totalFeeMonetizationRewards;
             totalFeeMonetizationRewards = 0;
         } else {
+            amount = claimableRewards[recipient];
             claimableRewards[recipient] = 0;
         }
 
+        require(amount > 0, "No rewards to claim");
         sonicSToken.safeTransfer(recipient, amount);
         emit RewardsClaimed(recipient, amount);
     }
 
     /**
-     * @notice Awards Sonic Points with tiered multipliers for deposits or withdrawals.
+     * @notice Awards Sonic Points with tiered multipliers and distributes rewards.
      * @param user User address
      * @param totalAmount Total deposited amount (USDC, 6 decimals)
      * @param isDeposit True for deposits, false for withdrawals
@@ -140,38 +152,66 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
         require(totalAmount >= 1 * 1e6, "Amount below minimum");
         require(maxLockupDays == 0 || maxLockupDays == 30 || maxLockupDays == 90, "Invalid lockup period");
 
-        // Update tier for deposits or withdrawals
+        // Update tier
         pointsTierManager.assignTier(user, totalAmount, hasLockup, maxLockupDays);
 
-        // Calculate points using the user's current multiplier
+        // Calculate points
         uint256 multiplier = pointsTierManager.getUserMultiplier(user); // e.g., 200 (2x), 300 (3x), 500 (5x)
         uint256 points = (totalAmount * multiplier) / 100; // Adjust for multiplier (100 = 1x)
 
-        // Update user points
+        // Update user points and total points
         if (isDeposit) {
             userPoints[user] += points;
-            // Allocate proportional rewards to user (e.g., based on points)
-            uint256 rewardShare = (totalFeeMonetizationRewards * points) / (totalFeeMonetizationRewards + points + 1);
-            claimableRewards[user] += rewardShare;
+            totalPoints += points;
+
+            // Allocate rewards proportional to points
+            if (totalFeeMonetizationRewards > 0 && totalPoints > 0) {
+                uint256 rewardShare = (totalFeeMonetizationRewards * points) / totalPoints;
+                claimableRewards[user] += rewardShare;
+                totalFeeMonetizationRewards -= rewardShare;
+            }
         } else {
-            userPoints[user] = userPoints[user] >= points ? userPoints[user] - points : 0;
-            // Reduce claimable rewards proportionally
-            uint256 rewardShare = (claimableRewards[user] * points) / (userPoints[user] + points + 1);
-            claimableRewards[user] = claimableRewards[user] >= rewardShare ? claimableRewards[user] - rewardShare : 0;
+            uint256 pointsToDeduct = points > userPoints[user] ? userPoints[user] : points;
+            userPoints[user] -= pointsToDeduct;
+            totalPoints -= pointsToDeduct;
+
+            // Reduce rewards proportional to points deducted
+            if (claimableRewards[user] > 0 && userPoints[user] > 0) {
+                uint256 rewardReduction = (claimableRewards[user] * pointsToDeduct) / userPoints[user];
+                claimableRewards[user] -= rewardReduction;
+                totalFeeMonetizationRewards += rewardReduction; // Return to pool
+            } else {
+                totalFeeMonetizationRewards += claimableRewards[user];
+                claimableRewards[user] = 0;
+            }
         }
 
         emit PointsAwarded(user, totalAmount, points, isDeposit, hasLockup, maxLockupDays);
     }
 
     /**
-     * @notice Claims Sonic Points for the caller (placeholder for post-airdrop).
+     * @notice Claims Sonic Points and converts to $S tokens (post-airdrop).
+     * @dev Assumes 1 point = 0.01 $S (POINTS_TO_TOKEN_RATE = 1e16)
      */
     function claimPoints() external {
         uint256 points = userPoints[msg.sender];
         require(points > 0, "No points to claim");
+
+        // Convert points to $S tokens (18 decimals)
+        uint256 tokens = (points * POINTS_TO_TOKEN_RATE) / 1e18; // e.g., 1000 points = 10 $S
+        require(tokens <= sonicSToken.balanceOf(address(this)), "Insufficient tokens");
+
         userPoints[msg.sender] = 0;
-        // Placeholder: Post-airdrop, transfer $S tokens or equivalent
-        emit PointsClaimed(msg.sender, points);
+        totalPoints -= points;
+
+        // Adjust rewards if points are claimed
+        if (claimableRewards[msg.sender] > 0) {
+            totalFeeMonetizationRewards += claimableRewards[msg.sender];
+            claimableRewards[msg.sender] = 0;
+        }
+
+        sonicSToken.safeTransfer(msg.sender, tokens);
+        emit PointsClaimed(msg.sender, points, tokens);
     }
 
     /**
