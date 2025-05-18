@@ -14,7 +14,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 // PRBMath import
 import "@prb/math/PRBMathUD60x18.sol";
 
-// Interfaces (unchanged from first version)
+// Interfaces
 interface IAaveV3Pool {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
@@ -105,7 +105,13 @@ interface ILooperCore {
 interface IStakingManager {
     function depositRewards(uint256 amount) external;
     function claimRewards() external;
-    function earnPoints(address user, uint256 amount, bool isAllocation) external;
+    function awardPoints(
+        address user,
+        uint256 amount,
+        bool isDeposit,
+        bool hasLockup,
+        uint256 maxLockupDays
+    ) external;
 }
 
 interface IGovernanceManager {
@@ -124,10 +130,15 @@ interface IGovernanceVault {
     function distributeProfits(uint256 amount) external;
 }
 
+interface IPointsTierManager {
+    function assignTier(address user, uint256 totalAmount, bool hasLockup, uint256 maxLockupDays) external;
+    function getUserMultiplier(address user) external view returns (uint256);
+}
+
 /**
  * @title YieldOptimizer
  * @notice A DeFi yield farming aggregator optimized for Sonic Blockchain, supporting Aave V3, Compound, FlyingTulip, and delegating RWA allocations to AIYieldOptimizer.
- * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points, and modular contracts.
+ * @dev Uses UUPS proxy, integrates with Sonic’s Fee Monetization, native USDC, RedStone oracles, Sonic Points, PointsTierManager, and modular contracts.
  */
 contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -149,7 +160,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     IStakingManager public stakingManager;
     IGovernanceManager public governanceManager;
     IUpkeepManager public upkeepManager;
-    IGovernanceVault public governanceVault; // Added for fee discounts
+    IGovernanceVault public governanceVault;
+    IPointsTierManager public pointsTierManager;
     address public feeRecipient;
     uint256 public managementFee; // Basis points (e.g., 50 = 0.5%)
     uint256 public performanceFee; // Basis points (e.g., 1000 = 10%)
@@ -161,6 +173,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     mapping(address => Allocation) public allocations;
     mapping(address => bool) public blacklistedUsers;
     mapping(address => uint256) public lastKnownAPYs;
+    mapping(address => Lockup[]) public userLockups;
 
     // Constants
     uint256 public constant BASIS_POINTS = 10000;
@@ -172,6 +185,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     uint256 private constant AAVE_REFERRAL_CODE = 0;
     uint256 private constant MIN_ALLOCATION = 1e16; // 0.01 USDC
     uint256 public immutable MIN_DEPOSIT;
+    uint256 private constant MAX_LOCKUPS = 10; // Limit to prevent gas issues
 
     // Structs
     struct Allocation {
@@ -191,6 +205,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         uint256 riskScore;
     }
 
+    struct Lockup {
+        uint256 amount; // Amount locked
+        uint256 lockupDays; // Lockup period in days
+        uint256 startTimestamp; // When lockup started
+    }
+
     // Events
     event Deposit(address indexed user, uint256 amount, uint256 fee, uint256 discount);
     event Withdraw(address indexed user, uint256 amount, uint256 fee, uint256 discount);
@@ -206,6 +226,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     event RWADelegatedToAI(address indexed aiYieldOptimizer, uint256 amount);
     event PauseToggled(bool status);
     event GovernanceVaultUpdated(address indexed newGovernanceVault);
+    event LockupCreated(address indexed user, uint256 amount, uint256 lockupDays, uint256 startTimestamp);
+    event PointsTierManagerUpdated(address indexed newPointsTierManager);
+    event TierUpdated(address indexed user, uint256 totalAmount, bool hasLockup, uint256 maxLockupDays);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -237,7 +260,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         address _governanceManager,
         address _upkeepManager,
         address _governanceVault,
-        address _feeRecipient
+        address _feeRecipient,
+        address _pointsTierManager
     ) external initializer {
         require(_stablecoin != address(0), "Invalid stablecoin address");
         require(_rwaYield != address(0), "Invalid RWAYield address");
@@ -255,6 +279,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(_upkeepManager != address(0), "Invalid UpkeepManager address");
         require(_governanceVault != address(0), "Invalid GovernanceVault address");
         require(_feeRecipient != address(0), "Invalid fee recipient");
+        require(_pointsTierManager != address(0), "Invalid PointsTierManager address");
 
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
@@ -276,6 +301,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         governanceManager = IGovernanceManager(_governanceManager);
         upkeepManager = IUpkeepManager(_upkeepManager);
         governanceVault = IGovernanceVault(_governanceVault);
+        pointsTierManager = IPointsTierManager(_pointsTierManager);
         feeRecipient = _feeRecipient;
         managementFee = 50; // 0.5%
         performanceFee = 1000; // 10%
@@ -290,7 +316,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /**
-     * @notice Deposits funds and allocates them to protocols with Sonic points tracking and fee discounts.
+     * @notice Deposits funds, allocates them to protocols, tracks lockups, and awards Sonic Points with aggregated tier multipliers.
      * @param amount Amount of USDC to deposit
      * @param useLockup Whether to apply a lockup period for staking
      * @param lockupDays Number of lockup days (e.g., 30 or 90)
@@ -310,9 +336,25 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         stablecoin.safeTransferFrom(msg.sender, address(this), amount);
         stablecoin.safeTransfer(feeRecipient, fee);
 
+        // Track lockup if applicable
+        if (useLockup && lockupDays > 0) {
+            Lockup[] storage lockups = userLockups[msg.sender];
+            require(lockups.length < MAX_LOCKUPS, "Max lockups reached");
+            lockups.push(Lockup({
+                amount: netAmount,
+                lockupDays: lockupDays,
+                startTimestamp: block.timestamp
+            }));
+            emit LockupCreated(msg.sender, netAmount, lockupDays, block.timestamp);
+        }
+
         userBalances[msg.sender] += netAmount;
         totalAllocated += netAmount;
-        stakingManager.earnPoints(msg.sender, netAmount, true);
+
+        // Calculate aggregated lockup status for tiering
+        (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
+        stakingManager.awardPoints(msg.sender, netAmount, true, hasLockup, maxLockupDays);
+        emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
 
         _allocateFunds(netAmount);
 
@@ -320,12 +362,16 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     }
 
     /**
-     * @notice Withdraws funds and distributes profits with fee discounts.
+     * @notice Withdraws funds, enforces lockup restrictions, and distributes profits with fee discounts.
      * @param amount Amount of USDC to withdraw
      */
     function withdraw(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be > 0");
         require(userBalances[msg.sender] >= amount, "Insufficient balance");
+
+        // Check available unlocked balance
+        uint256 unlockedBalance = getUnlockedBalance(msg.sender);
+        require(unlockedBalance >= amount, "Locked funds");
 
         uint256 profit = _calculateProfit(msg.sender, amount);
         uint256 discount = governanceVault.getFeeDiscount(msg.sender); // 0, 25, or 50 (%)
@@ -333,9 +379,16 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         uint256 performanceFeeAmount = (profit * feeRate) / BASIS_POINTS;
         uint256 netProfit = profit - performanceFeeAmount;
 
+        // Update lockups by reducing amounts or removing expired ones
+        _updateLockups(msg.sender, amount);
+
         userBalances[msg.sender] -= amount;
         totalAllocated -= amount;
-        stakingManager.earnPoints(msg.sender, amount, false);
+
+        // Update tier after withdrawal
+        (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
+        stakingManager.awardPoints(msg.sender, amount, false, hasLockup, maxLockupDays);
+        emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
 
         uint256 withdrawnAmount = _deallocateFunds(amount);
         require(withdrawnAmount >= amount, "Insufficient funds withdrawn");
@@ -361,6 +414,13 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         totalAllocated -= amount;
         stablecoin.safeTransfer(msg.sender, amount);
 
+        // Clear lockups during emergency (no restrictions)
+        delete userLockups[msg.sender];
+
+        // Update tier to reflect zero balance
+        stakingManager.awardPoints(msg.sender, amount, false, false, 0);
+        emit TierUpdated(msg.sender, 0, false, 0);
+
         emit UserEmergencyWithdraw(msg.sender, amount);
     }
 
@@ -372,6 +432,99 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(_governanceVault != address(0), "Invalid GovernanceVault");
         governanceVault = IGovernanceVault(_governanceVault);
         emit GovernanceVaultUpdated(_governanceVault);
+    }
+
+    /**
+     * @notice Updates the PointsTierManager address.
+     * @param _pointsTierManager New PointsTierManager address
+     */
+    function setPointsTierManager(address _pointsTierManager) external onlyOwner {
+        require(_pointsTierManager != address(0), "Invalid PointsTierManager");
+        pointsTierManager = IPointsTierManager(_pointsTierManager);
+        emit PointsTierManagerUpdated(_pointsTierManager);
+    }
+
+    /**
+     * @notice Calculates the unlocked balance for a user.
+     * @param user User address
+     * @return Unlocked balance (funds available for withdrawal)
+     */
+    function getUnlockedBalance(address user) public view returns (uint256) {
+        uint256 totalBalance = userBalances[user];
+        uint256 lockedAmount = 0;
+        Lockup[] storage lockups = userLockups[user];
+
+        for (uint256 i = 0; i < lockups.length; i++) {
+            if (block.timestamp < lockups[i].startTimestamp + (lockups[i].lockupDays * 1 days)) {
+                lockedAmount += lockups[i].amount;
+            }
+        }
+
+        return totalBalance >= lockedAmount ? totalBalance - lockedAmount : 0;
+    }
+
+    /**
+     * @notice Updates lockups by reducing amounts or removing expired ones.
+     * @param user User address
+     * @param withdrawAmount Amount to withdraw
+     */
+    function _updateLockups(address user, uint256 withdrawAmount) internal {
+        Lockup[] storage lockups = userLockups[user];
+        uint256 remaining = withdrawAmount;
+
+        // First, try to deduct from unlocked (expired) lockups
+        for (uint256 i = 0; i < lockups.length && remaining > 0; i++) {
+            if (block.timestamp >= lockups[i].startTimestamp + (lockups[i].lockupDays * 1 days)) {
+                uint256 deduct = remaining >= lockups[i].amount ? lockups[i].amount : remaining;
+                lockups[i].amount -= deduct;
+                remaining -= deduct;
+            }
+        }
+
+        // If still remaining, deduct from non-locked balance (implicitly handled by getUnlockedBalance)
+        require(remaining == 0, "Locked funds");
+
+        // Clean up zero-amount or expired lockups
+        uint256 writeIndex = 0;
+        for (uint256 i = 0; i < lockups.length; i++) {
+            if (lockups[i].amount > 0) {
+                lockups[writeIndex] = lockups[i];
+                writeIndex++;
+            }
+        }
+        while (lockups.length > writeIndex) {
+            lockups.pop();
+        }
+    }
+
+    /**
+     * @notice Gets a user’s lockup details.
+     * @param user User address
+     * @return Array of Lockup structs
+     */
+    function getUserLockups(address user) external view returns (Lockup[] memory) {
+        return userLockups[user];
+    }
+
+    /**
+     * @notice Gets a user’s aggregated lockup status for tiering.
+     * @param user User address
+     * @return hasLockup True if any active lockup exists
+     * @return maxLockupDays Longest active lockup period
+     */
+    function getUserLockupStatus(address user) public view returns (bool hasLockup, uint256 maxLockupDays) {
+        Lockup[] storage lockups = userLockups[user];
+        hasLockup = false;
+        maxLockupDays = 0;
+
+        for (uint256 i = 0; i < lockups.length; i++) {
+            if (block.timestamp < lockups[i].startTimestamp + (lockups[i].lockupDays * 1 days)) {
+                hasLockup = true;
+                if (lockups[i].lockupDays > maxLockupDays) {
+                    maxLockupDays = lockups[i].lockupDays;
+                }
+            }
+        }
     }
 
     /**
@@ -556,7 +709,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 uint256 ltv = _getLTV(protocols[i], allocAmount);
                 looperCore.applyLeverage(protocols[i], allocAmount, ltv, false);
             }
-            stakingManager.earnPoints(msg.sender, allocAmount, true);
             emit AIAllocationOptimized(protocols[i], allocAmount, apys[i], isLeveraged);
         }
 
@@ -571,7 +723,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             aiYieldOptimizer.submitAIAllocation(rwaProtocols, amounts, isLeveraged);
             string memory logicDescription = aiYieldOptimizer.getAllocationLogic(rwaAmount);
             emit AIAllocationDetails(rwaProtocols, amounts, isLeveraged, logicDescription);
-            stakingManager.earnPoints(msg.sender, rwaAmount, true);
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount);
         }
     }
@@ -594,7 +745,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 uint256 withdrawAmount = rwaWithdrawAmount > availableLiquidity ? availableLiquidity : rwaWithdrawAmount;
                 try aiYieldOptimizer.withdrawForYieldOptimizer(protocol, withdrawAmount) returns (uint256 withdrawn) {
                     totalWithdrawn += withdrawn;
-                    stakingManager.earnPoints(msg.sender, withdrawn, false);
+                    (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
+                    stakingManager.awardPoints(msg.sender, withdrawn, false, hasLockup, maxLockupDays);
+                    emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
                 } catch {
                     emit AIAllocationOptimized(protocol, 0, 0, false);
                 }
@@ -612,7 +765,9 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 uint256 withdrawn = _withdrawFromProtocol(protocol, withdrawAmount);
                 alloc.amount -= withdrawn;
                 totalWithdrawn += withdrawn;
-                stakingManager.earnPoints(msg.sender, withdrawn, false);
+                (bool hasLockup, uint256 maxLockupDays) = getUserLockupStatus(msg.sender);
+                stakingManager.awardPoints(msg.sender, withdrawn, false, hasLockup, maxLockupDays);
+                emit TierUpdated(msg.sender, userBalances[msg.sender], hasLockup, maxLockupDays);
             }
         }
         _cleanAllocations();
