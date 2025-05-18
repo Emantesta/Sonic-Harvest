@@ -194,25 +194,26 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
      * @dev Assumes 1 point = 0.01 $S (POINTS_TO_TOKEN_RATE = 1e16)
      */
     function claimPoints() external {
-        uint256 points = userPoints[msg.sender];
-        require(points > 0, "No points to claim");
+       uint256 points = userPoints[msg.sender];
+       require(points > 0, "No points to claim");
+       uint256 tokens = (points * POINTS_TO_TOKEN_RATE) / 1e18;
+       require(tokens <= sonicSToken.balanceOf(address(this)), "Insufficient tokens");
 
-        // Convert points to $S tokens (18 decimals)
-        uint256 tokens = (points * POINTS_TO_TOKEN_RATE) / 1e18; // e.g., 1000 points = 10 $S
-        require(tokens <= sonicSToken.balanceOf(address(this)), "Insufficient tokens");
+       // Vesting: 25% upfront, 75% vested
+       uint256 upfront = tokens / 4;
+       uint256 vested = tokens - upfront;
+       // Burn 10% if claimed early (placeholder)
+       uint256 burnAmount = block.timestamp < airdropStart + 30 days ? tokens / 10 : 0;
+       sonicSToken.safeTransfer(msg.sender, upfront - burnAmount);
+       if (burnAmount > 0) sonicSToken.safeTransfer(address(0), burnAmount);
+       // Vested tokens handled via separate vesting contract (TBD)
 
-        userPoints[msg.sender] = 0;
-        totalPoints -= points;
-
-        // Adjust rewards if points are claimed
-        if (claimableRewards[msg.sender] > 0) {
-            totalFeeMonetizationRewards += claimableRewards[msg.sender];
-            claimableRewards[msg.sender] = 0;
-        }
-
-        sonicSToken.safeTransfer(msg.sender, tokens);
-        emit PointsClaimed(msg.sender, points, tokens);
-    }
+       userPoints[msg.sender] = 0;
+       totalPoints -= points;
+       totalFeeMonetizationRewards += claimableRewards[msg.sender];
+       claimableRewards[msg.sender] = 0;
+       emit PointsClaimed(msg.sender, points, upfront - burnAmount);
+   }
 
     /**
      * @notice Updates the PointsTierManager address.
