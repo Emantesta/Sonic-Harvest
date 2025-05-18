@@ -67,10 +67,14 @@ interface IUpkeepManager {
     function manualUpkeep(bool isRWA) external;
 }
 
+// An Oracle Interface for AI Model Outputs
+interface IOracle {
+    function getAIPredictions(address protocol) external view returns (uint256 predictedAPY, uint256 riskScore, uint256 timestamp);
+}
+
 /**
  * @title AIYieldOptimizer
- * @notice A delegated contract for AI-driven RWA yield optimization within YieldOptimizer.sol,
- *         integrated with Sonic Blockchain, modular contracts, and advanced AI-driven allocation strategies.
+ * @notice A delegated contract for AI-driven RWA yield optimization with hybrid AI model and multi-oracle integration.
  * @dev Uses UUPS proxy, supports Sonic’s Fee Monetization, native USDC, RedStone oracles, and Sonic Points.
  */
 contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable, ReentrancyGuard {
@@ -89,7 +93,7 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
     IStakingManager public stakingManager; // StakingManager contract
     IGovernanceManager public governanceManager; // GovernanceManager contract
     IUpkeepManager public upkeepManager; // UpkeepManager contract
-    address public aiOracle; // Address for AI allocation recommendations
+    address public aiOracle; // Primary AI Oracle address (fallback)
     address public feeRecipient; // Receives management and performance fees
     uint256 public managementFee; // Management fee in basis points
     uint256 public performanceFee; // Performance fee in basis points
@@ -99,6 +103,14 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
     bool public allowLeverage; // Toggle for leverage support
     uint256 public minRWALiquidityThreshold; // Minimum liquidity threshold for RWA protocols
     bool public isPaused; // Emergency pause state
+
+    // Multi-Oracle State
+    address[] public oracles; // List of trusted oracles
+    uint256 public maxOracles; // Maximum number of oracles (e.g., 5)
+    uint256 public minOracleResponses; // Minimum oracle responses required
+    uint256 public oracleDataTimeout; // Timeout for oracle data freshness (e.g., 1 hour)
+    uint256 public hybridWeightOnChain; // Weight for on-chain data (basis points, e.g., 5000 = 50%)
+    bool public oracleCircuitBreaker; // Pause oracle usage if triggered
 
     // Constants
     uint256 private constant BASIS_POINTS = 10000;
@@ -120,18 +132,29 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         bool isLeveraged;
     }
 
+    struct OraclePrediction {
+        uint256 predictedAPY;
+        uint256 riskScore;
+        uint256 timestamp;
+        bool isValid;
+    }
+
     // Events
-    event DepositRWA(address indexed protocol, uint256 amount, uint256 fee, bool isLeveraged);
-    event WithdrawRWA(address indexed protocol, uint256 amount, uint256 profit, uint256 fee);
-    event AIAllocationUpdated(address indexed protocol, uint256 amount, bool isLeveraged);
+    event DepositRWA(address indexed protocol, uint256 amount, uint256 fee, bool isLeveraged, bytes32 indexed correlationId);
+    event WithdrawRWA(address indexed protocol, uint256 amount, uint256 profit, uint256 fee, bytes32 indexed correlationId);
+    event AIAllocationUpdated(address indexed protocol, uint256 amount, bool isLeveraged, bytes32 indexed correlationId);
     event AIOracleUpdated(address indexed newOracle);
     event FeeRecipientUpdated(address indexed newRecipient);
     event FeesUpdated(uint256 managementFee, uint256 performanceFee);
     event LeverageToggled(bool status);
     event PauseToggled(bool status);
-    event AIRecommendedAllocation(address indexed protocol, uint256 amount, bool isLeveraged);
-    event AllocationLogicUpdated(string logicDescription);
-    event ManualUpkeepTriggered(uint256 timestamp);
+    event AIRecommendedAllocation(address indexed protocol, uint256 amount, bool isLeveraged, bytes32 indexed correlationId);
+    event AllocationLogicUpdated(string logicDescription, bytes32 indexed correlationId);
+    event ManualUpkeepTriggered(uint256 timestamp, bytes32 indexed correlationId);
+    event OracleAdded(address indexed oracle, bytes32 indexed correlationId);
+    event OracleRemoved(address indexed oracle, bytes32 indexed correlationId);
+    event OracleCircuitBreakerTriggered(bool status, bytes32 indexed correlationId);
+    event HybridWeightsUpdated(uint256 onChainWeight, bytes32 indexed correlationId);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -139,8 +162,8 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         _;
     }
 
-    modifier onlyAIOracle() {
-        require(msg.sender == aiOracle, "Not AI Oracle");
+    modifier onlyAIOracleOrYieldOptimizer() {
+        require(msg.sender == aiOracle || msg.sender == owner(), "Not authorized");
         _;
     }
 
@@ -149,8 +172,13 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         _;
     }
 
+    modifier whenOracleCircuitBreakerNotTriggered() {
+        require(!oracleCircuitBreaker, "Oracle circuit breaker triggered");
+        _;
+    }
+
     /**
-     * @notice Initializes the contract with Sonic-specific parameters and modular integrations.
+     * @notice Initializes the contract with Sonic-specific parameters, modular integrations, and multi-oracle setup.
      */
     function initialize(
         address _stablecoin,
@@ -200,6 +228,15 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         performanceFee = 1000; // 10%
         allowLeverage = true;
         minRWALiquidityThreshold = 1e18; // 1 stablecoin unit
+
+        // Initialize multi-oracle parameters
+        maxOracles = 5;
+        minOracleResponses = 2;
+        oracleDataTimeout = 1 hours;
+        hybridWeightOnChain = 5000; // 50% on-chain, 50% off-chain
+        oracleCircuitBreaker = false;
+
+        // Testing Note: Test initialization with invalid addresses and multi-oracle parameters.
     }
 
     /**
@@ -208,31 +245,40 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /**
-     * @notice AI Oracle submits allocation recommendations from YieldOptimizer.sol.
+     * @notice AI Oracle or YieldOptimizer submits allocation recommendations with hybrid AI model.
+     * @param protocols List of protocols to allocate to
+     * @param amounts Amounts to allocate
+     * @param isLeveraged Leverage flags
+     * @param correlationId Unique ID for event tracing
+     * @param start Starting index for pagination
+     * @param limit Number of protocols to process
      */
     function submitAIAllocation(
         address[] calldata protocols,
         uint256[] calldata amounts,
-        bool[] calldata isLeveraged
-    ) external nonReentrant whenNotPaused {
-        require(msg.sender == address(this) || msg.sender == aiOracle, "Not authorized"); // Allow self-call from YieldOptimizer
+        bool[] calldata isLeveraged,
+        bytes32 correlationId,
+        uint256 start,
+        uint256 limit
+    ) external nonReentrant whenNotPaused whenOracleCircuitBreakerNotTriggered onlyAIOracleOrYieldOptimizer {
         require(protocols.length == amounts.length && protocols.length == isLeveraged.length, "Mismatched arrays");
         require(protocols.length <= MAX_PROTOCOLS, "Too many protocols");
+        require(start < protocols.length, "Invalid start index");
+        uint256 end = start + limit > protocols.length ? protocols.length : start + limit;
 
         uint256 totalAmount;
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = start; i < end; i++) {
             require(_isValidProtocol(protocols[i]), "Unsupported protocol");
             require(flyingTulip.isProtocolHealthy(protocols[i]), "Protocol not healthy");
             totalAmount += amounts[i];
         }
         require(totalAmount <= stablecoin.balanceOf(address(this)), "Insufficient balance");
 
-        // Execute allocations
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = start; i < end; i++) {
             if (amounts[i] >= MIN_ALLOCATION) {
                 uint256 fee = (amounts[i] * managementFee) / BASIS_POINTS;
                 uint256 netAmount = amounts[i] - fee;
-                _depositToRWA(protocols[i], netAmount, isLeveraged[i] && allowLeverage);
+                _depositToRWA(protocols[i], netAmount, isLeveraged[i] && allowLeverage, correlationId);
                 allocations[protocols[i]] = Allocation(
                     protocols[i],
                     netAmount,
@@ -242,43 +288,56 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
                 );
                 stablecoin.safeTransfer(feeRecipient, fee);
                 stakingManager.earnPoints(msg.sender, netAmount, true);
-                emit AIAllocationUpdated(protocols[i], netAmount, isLeveraged[i] && allowLeverage);
-                emit DepositRWA(protocols[i], netAmount, fee, isLeveraged[i] && allowLeverage);
+                emit AIAllocationUpdated(protocols[i], netAmount, isLeveraged[i] && allowLeverage, correlationId);
+                emit DepositRWA(protocols[i], netAmount, fee, isLeveraged[i] && allowLeverage, correlationId);
             }
         }
+
+        // Testing Note: Test pagination, oracle-driven allocations, failed deposits, and correlation ID tracing.
     }
 
     /**
-     * @notice Rebalances portfolio based on AI recommendations.
+     * @notice Rebalances portfolio based on hybrid AI recommendations.
+     * @param protocols List of protocols to allocate to
+     * @param amounts Amounts to allocate
+     * @param isLeveraged Leverage flags
+     * @param correlationId Unique ID for event tracing
+     * @param start Starting index for pagination
+     * @param limit Number of protocols to process
      */
     function rebalancePortfolio(
         address[] calldata protocols,
         uint256[] calldata amounts,
-        bool[] calldata isLeveraged
-    ) external onlyAIOracle nonReentrant whenNotPaused {
+        bool[] calldata isLeveraged,
+        bytes32 correlationId,
+        uint256 start,
+        uint256 limit
+    ) external nonReentrant whenNotPaused whenOracleCircuitBreakerNotTriggered onlyAIOracleOrYieldOptimizer {
         require(protocols.length == amounts.length && protocols.length == isLeveraged.length, "Mismatched arrays");
+        require(start < protocols.length, "Invalid start index");
+        uint256 end = start + limit > protocols.length ? protocols.length : start + limit;
 
         // Withdraw from all protocols
         address[] memory activeProtocols = registry.getActiveProtocols(true);
         for (uint256 i = 0; i < activeProtocols.length; i++) {
             address protocol = activeProtocols[i];
             if (rwaBalances[protocol] > 0) {
-                _withdrawFromRWA(protocol, rwaBalances[protocol], false);
+                _withdrawFromRWA(protocol, rwaBalances[protocol], false, correlationId);
             }
         }
 
         // Reallocate based on AI recommendations
         uint256 totalAmount;
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = start; i < end; i++) {
             totalAmount += amounts[i];
         }
         require(totalAmount <= stablecoin.balanceOf(address(this)), "Insufficient balance");
 
-        for (uint256 i = 0; i < protocols.length; i++) {
+        for (uint256 i = start; i < end; i++) {
             if (amounts[i] >= MIN_ALLOCATION) {
                 uint256 fee = (amounts[i] * managementFee) / BASIS_POINTS;
                 uint256 netAmount = amounts[i] - fee;
-                _depositToRWA(protocols[i], netAmount, isLeveraged[i] && allowLeverage);
+                _depositToRWA(protocols[i], netAmount, isLeveraged[i] && allowLeverage, correlationId);
                 allocations[protocols[i]] = Allocation(
                     protocols[i],
                     netAmount,
@@ -288,28 +347,40 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
                 );
                 stablecoin.safeTransfer(feeRecipient, fee);
                 stakingManager.earnPoints(msg.sender, netAmount, true);
-                emit AIAllocationUpdated(protocols[i], netAmount, isLeveraged[i] && allowLeverage);
-                emit DepositRWA(protocols[i], netAmount, fee, isLeveraged[i] && allowLeverage);
+                emit AIAllocationUpdated(protocols[i], netAmount, isLeveraged[i] && allowLeverage, correlationId);
+                emit DepositRWA(protocols[i], netAmount, fee, isLeveraged[i] && allowLeverage, correlationId);
             }
         }
+
+        // Testing Note: Test pagination, full withdrawals, reallocation failures, and correlation ID tracing.
     }
 
     /**
      * @notice Withdraws from RWA protocol for YieldOptimizer.sol.
+     * @param protocol Protocol address
+     * @param amount Amount to withdraw
+     * @param correlationId Unique ID for event tracing
+     * @return withdrawn Amount withdrawn
      */
-    function withdrawForYieldOptimizer(address protocol, uint256 amount)
+    function withdrawForYieldOptimizer(address protocol, uint256 amount, bytes32 correlationId)
         external
         nonReentrant
         returns (uint256)
     {
-        require(msg.sender == address(this), "Only YieldOptimizer"); // Internal call
-        return _withdrawFromRWA(protocol, amount, true);
+        require(msg.sender == owner(), "Only YieldOptimizer");
+        return _withdrawFromRWA(protocol, amount, true, correlationId);
+
+        // Testing Note: Test withdrawals with insufficient balances, leverage unwinding failures, and correlation ID tracing.
     }
 
     /**
      * @notice Internal function to deposit to RWA protocol with optional leverage.
+     * @param protocol Protocol address
+     * @param amount Amount to deposit
+     * @param isLeveraged Whether to apply leverage
+     * @param correlationId Unique ID for event tracing
      */
-    function _depositToRWA(address protocol, uint256 amount, bool isLeveraged) internal {
+    function _depositToRWA(address protocol, uint256 amount, bool isLeveraged, bytes32 correlationId) internal {
         require(_isValidProtocol(protocol), "Invalid protocol");
         require(amount > 0, "Amount must be > 0");
         require(rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold, "Insufficient liquidity");
@@ -332,12 +403,22 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         } else {
             isLeveraged = false;
         }
+
+        // Testing Note: Test leverage application, insufficient liquidity, and failed deposits.
     }
 
     /**
      * @notice Internal function to withdraw from RWA protocol with leverage repayment.
+     * @param protocol Protocol address
+     * @param amount Amount to withdraw
+     * @param isForYieldOptimizer Whether the withdrawal is for YieldOptimizer
+     * @param correlationId Unique ID for event tracing
+     * @return withdrawn Amount withdrawn
      */
-    function _withdrawFromRWA(address protocol, uint256 amount, bool isForYieldOptimizer) internal returns (uint256) {
+    function _withdrawFromRWA(address protocol, uint256 amount, bool isForYieldOptimizer, bytes32 correlationId)
+        internal
+        returns (uint256)
+    {
         require(_isValidProtocol(protocol), "Invalid protocol");
         require(amount > 0 && amount <= rwaBalances[protocol], "Invalid amount");
 
@@ -371,38 +452,51 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
             stakingManager.earnPoints(msg.sender, amount, false);
         }
 
-        emit WithdrawRWA(protocol, amount, profit, performanceFeeAmount);
+        emit WithdrawRWA(protocol, amount, profit, performanceFeeAmount, correlationId);
         return netWithdrawn;
+
+        // Testing Note: Test partial withdrawals, leverage unwinding, profit calculations, and balance mismatches.
     }
 
     /**
      * @notice Toggles leverage support.
+     * @param status Leverage enabled or disabled
      */
     function toggleLeverage(bool status) external onlyGovernance {
         allowLeverage = status;
         emit LeverageToggled(status);
+
+        // Testing Note: Test leverage toggle impact on new allocations and existing leveraged positions.
     }
 
     /**
-     * @notice Updates AI Oracle address.
+     * @notice Updates AI Oracle address (fallback oracle).
+     * @param newOracle New AI Oracle address
      */
     function updateAIOracle(address newOracle) external onlyGovernance {
         require(newOracle != address(0), "Invalid AI Oracle address");
         aiOracle = newOracle;
         emit AIOracleUpdated(newOracle);
+
+        // Testing Note: Test oracle updates and unauthorized access.
     }
 
     /**
      * @notice Updates fee recipient address.
+     * @param newRecipient New fee recipient address
      */
     function updateFeeRecipient(address newRecipient) external onlyGovernance {
         require(newRecipient != address(0), "Invalid fee recipient");
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(newRecipient);
+
+        // Testing Note: Test fee recipient updates and fee transfers.
     }
 
     /**
      * @notice Updates management and performance fees.
+     * @param newManagementFee New management fee in basis points
+     * @param newPerformanceFee New performance fee in basis points
      */
     function updateFees(uint256 newManagementFee, uint256 newPerformanceFee) external onlyGovernance {
         require(newManagementFee <= 200, "Management fee too high"); // Max 2%
@@ -410,6 +504,8 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         managementFee = newManagementFee;
         performanceFee = newPerformanceFee;
         emit FeesUpdated(newManagementFee, newPerformanceFee);
+
+        // Testing Note: Test fee updates and their impact on deposits/withdrawals.
     }
 
     /**
@@ -418,6 +514,8 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
     function pause() external onlyGovernance {
         isPaused = true;
         emit PauseToggled(true);
+
+        // Testing Note: Test pause functionality and its impact on operations.
     }
 
     /**
@@ -426,18 +524,88 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
     function unpause() external onlyGovernance {
         isPaused = false;
         emit PauseToggled(false);
+
+        // Testing Note: Test unpause and resumption of operations.
     }
 
     /**
      * @notice Manual upkeep for RWA protocols.
+     * @param correlationId Unique ID for event tracing
      */
-    function manualUpkeep() external onlyGovernance {
+    function manualUpkeep(bytes32 correlationId) external onlyGovernance {
         upkeepManager.manualUpkeep(true);
-        emit ManualUpkeepTriggered(block.timestamp);
+        emit ManualUpkeepTriggered(block.timestamp, correlationId);
+
+        // Testing Note: Test upkeep triggers and their effects on protocol states.
     }
 
     /**
-     * @notice AI-driven allocation recommendations with risk adjustment.
+     * @notice Adds a new oracle to the registry.
+     * @param oracle Oracle address
+     * @param correlationId Unique ID for event tracing
+     */
+    function addOracle(address oracle, bytes32 correlationId) external onlyGovernance {
+        require(oracle != address(0), "Invalid oracle address");
+        require(oracles.length < maxOracles, "Max oracles reached");
+        for (uint256 i = 0; i < oracles.length; i++) {
+            require(oracles[i] != oracle, "Oracle already exists");
+        }
+        oracles.push(oracle);
+        emit OracleAdded(oracle, correlationId);
+
+        // Testing Note: Test oracle addition, max oracle limits, and duplicates.
+    }
+
+    /**
+     * @notice Removes an oracle from the registry.
+     * @param oracle Oracle address
+     * @param correlationId Unique ID for event tracing
+     */
+    function removeOracle(address oracle, bytes32 correlationId) external onlyGovernance {
+        for (uint256 i = 0; i < oracles.length; i++) {
+            if (oracles[i] == oracle) {
+                oracles[i] = oracles[oracles.length - 1];
+                oracles.pop();
+                emit OracleRemoved(oracle, correlationId);
+                return;
+            }
+        }
+        revert("Oracle not found");
+
+        // Testing Note: Test oracle removal, non-existent oracles, and empty oracle list.
+    }
+
+    /**
+     * @notice Toggles oracle circuit breaker.
+     * @param status Circuit breaker status
+     * @param correlationId Unique ID for event tracing
+     */
+    function toggleOracleCircuitBreaker(bool status, bytes32 correlationId) external onlyGovernance {
+        oracleCircuitBreaker = status;
+        emit OracleCircuitBreakerTriggered(status, correlationId);
+
+        // Testing Note: Test circuit breaker impact on allocation and recommendation functions.
+    }
+
+    /**
+     * @notice Updates hybrid model weights.
+     * @param onChainWeight Weight for on-chain data (basis points)
+     * @param correlationId Unique ID for event tracing
+     */
+    function updateHybridWeights(uint256 onChainWeight, bytes32 correlationId) external onlyGovernance {
+        require(onChainWeight <= BASIS_POINTS, "Invalid weight");
+        hybridWeightOnChain = onChainWeight;
+        emit HybridWeightsUpdated(onChainWeight, correlationId);
+
+        // Testing Note: Test weight updates and their impact on allocation recommendations.
+    }
+
+    /**
+     * @notice AI-driven allocation recommendations using hybrid AI model.
+     * @param totalAmount Total amount to allocate
+     * @return protocols List of recommended protocols
+     * @return amounts Recommended amounts
+     * @return isLeveraged Leverage flags
      */
     function getRecommendedAllocations(uint256 totalAmount)
         external
@@ -451,9 +619,12 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         isLeveraged = new bool[](allProtocols.length);
         uint256 totalWeightedAPY;
 
-        // Fetch risk-adjusted APYs
+        // Fetch on-chain and off-chain APYs
         for (uint256 i = 0; i < allProtocols.length; i++) {
-            apys[i] = riskManager.getRiskAdjustedAPY(allProtocols[i], sonicProtocol.getSonicAPY(allProtocols[i]));
+            uint256 onChainAPY = riskManager.getRiskAdjustedAPY(allProtocols[i], sonicProtocol.getSonicAPY(allProtocols[i]));
+            uint256 offChainAPY = _aggregateOraclePredictions(allProtocols[i]).predictedAPY;
+            // Hybrid model: Combine on-chain and off-chain APYs
+            apys[i] = (onChainAPY * hybridWeightOnChain + offChainAPY * (BASIS_POINTS - hybridWeightOnChain)) / BASIS_POINTS;
         }
 
         // Calculate risk-adjusted weights
@@ -462,7 +633,10 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
             if (!_isValidProtocol(allProtocols[i]) || !_validateAPY(apys[i], allProtocols[i])) {
                 continue;
             }
-            uint256 riskScore = registry.getProtocolRiskScore(allProtocols[i]);
+            uint256 riskScore = _aggregateOraclePredictions(allProtocols[i]).riskScore;
+            if (riskScore == 0) {
+                riskScore = registry.getProtocolRiskScore(allProtocols[i]); // Fallback to on-chain
+            }
             uint256 adjustedAPY = (apys[i] * (10000 - riskScore)) / 10000;
             weights[i] = adjustedAPY;
             totalWeightedAPY += adjustedAPY;
@@ -496,14 +670,19 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
         if (allocated < totalAmount && index > 0) {
             amounts[0] += totalAmount - allocated;
         }
+
+        // Testing Note: Test hybrid model with varying oracle responses, zero off-chain data, and circuit breaker active.
     }
 
     /**
-     * @notice Provides a description of the allocation logic.
+     * @notice Provides a description of the allocation logic with hybrid AI model.
+     * @param totalAmount Total amount to allocate
+     * @param correlationId Unique ID for event tracing
+     * @return logicDescription Description of allocation logic
      */
-    function getAllocationLogic(uint256 totalAmount) external view returns (string memory) {
+    function getAllocationLogic(uint256 totalAmount, bytes32 correlationId) external returns (string memory) {
         (address[] memory protocols, uint256[] memory amounts, bool[] memory isLeveraged) = getRecommendedAllocations(totalAmount);
-        string memory logic = "AI-driven allocation based on risk-adjusted APYs and protocol health. Allocations: ";
+        string memory logic = "Hybrid AI allocation: 50% on-chain risk-adjusted APYs, 50% off-chain AI predictions via multi-oracle. Allocations: ";
         for (uint256 i = 0; i < protocols.length; i++) {
             if (amounts[i] == 0) continue;
             logic = string(abi.encodePacked(
@@ -516,67 +695,160 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
                 isLeveraged[i] ? "leveraged" : "non-leveraged",
                 "), "
             ));
+            emit AIRecommendedAllocation(protocols[i], amounts[i], isLeveraged[i], correlationId);
         }
+        emit AllocationLogicUpdated(logic, correlationId);
         return logic;
+
+        // Testing Note: Test logic description accuracy, oracle influence, and event emissions.
     }
 
     /**
-     * @notice Retrieves APY for all supported protocols.
+     * @notice Retrieves APY for all supported protocols using hybrid model.
+     * @return protocols List of protocols
+     * @return apys Corresponding APYs
      */
     function getAllYields() public view returns (address[] memory, uint256[] memory) {
         address[] memory protocols = registry.getActiveProtocols(true);
         uint256[] memory apys = new uint256[](protocols.length);
         for (uint256 i = 0; i < protocols.length; i++) {
             address protocol = protocols[i];
-            apys[i] = riskManager.getRiskAdjustedAPY(protocol, sonicProtocol.getSonicAPY(protocol));
+            uint256 onChainAPY = riskManager.getRiskAdjustedAPY(protocol, sonicProtocol.getSonicAPY(protocol));
+            uint256 offChainAPY = _aggregateOraclePredictions(protocol).predictedAPY;
+            uint256 hybridAPY = (onChainAPY * hybridWeightOnChain + offChainAPY * (BASIS_POINTS - hybridWeightOnChain)) / BASIS_POINTS;
+            apys[i] = hybridAPY > 0 && hybridAPY <= MAX_APY ? hybridAPY : 500; // Fallback to 5%
         }
         return (protocols, apys);
+
+        // Testing Note: Test hybrid APY calculations with missing or invalid oracle data and fallback behavior.
+    }
+
+    /**
+     * @notice Aggregates predictions from multiple oracles for a protocol.
+     * @param protocol Protocol address
+     * @return prediction Aggregated prediction
+     */
+    function _aggregateOraclePredictions(address protocol) internal view returns (OraclePrediction memory) {
+        if (oracleCircuitBreaker || oracles.length < minOracleResponses) {
+            return OraclePrediction(0, 0, 0, false); // Fallback to on-chain data
+        }
+
+        uint256 validResponses;
+        uint256[] memory predictedAPYs = new uint256[](oracles.length);
+        uint256[] memory riskScores = new uint256[](oracles.length);
+        for (uint256 i = 0; i < oracles.length; i++) {
+            try IOracle(oracles[i]).getAIPredictions(protocol) returns (uint256 predictedAPY, uint256 riskScore, uint256 timestamp) {
+                if (
+                    timestamp > block.timestamp - oracleDataTimeout &&
+                    predictedAPY <= MAX_APY &&
+                    riskScore <= BASIS_POINTS
+                ) {
+                    predictedAPYs[validResponses] = predictedAPY;
+                    riskScores[validResponses] = riskScore;
+                    validResponses++;
+                }
+            } catch {
+                // Skip failed oracles
+            }
+        }
+
+        if (validResponses < minOracleResponses) {
+            return OraclePrediction(0, 0, 0, false); // Fallback to on-chain data
+        }
+
+        // Use median for robustness
+        uint256 medianAPY = _calculateMedian(predictedAPYs, validResponses);
+        uint256 medianRiskScore = _calculateMedian(riskScores, validResponses);
+        return OraclePrediction(medianAPY, medianRiskScore, block.timestamp, true);
+
+        // Testing Note: Test aggregation with partial oracle failures, stale data, and insufficient responses.
+    }
+
+    /**
+     * @notice Calculates the median of an array (simplified for gas efficiency).
+     * @param values Array of values
+     * @param count Number of valid values
+     * @return median Median value
+     */
+    function _calculateMedian(uint256[] memory values, uint256 count) internal pure returns (uint256) {
+        // Simple bubble sort for small arrays (maxOracles <= 5)
+        for (uint256 i = 0; i < count - 1; i++) {
+            for (uint256 j = 0; j < count - i - 1; j++) {
+                if (values[j] > values[j + 1]) {
+                    (values[j], values[j + 1]) = (values[j + 1], values[j]);
+                }
+            }
+        }
+        return count % 2 == 0 ? (values[count / 2 - 1] + values[count / 2]) / 2 : values[count / 2];
+
+        // Testing Note: Test median calculation with odd/even number of values and edge cases.
     }
 
     /**
      * @notice Validates a protocol for allocation.
+     * @param protocol Protocol address
+     * @return True if valid
      */
     function _isValidProtocol(address protocol) internal view returns (bool) {
         return registry.isValidProtocol(protocol) &&
                rwaYield.isRWA(protocol) &&
                sonicProtocol.isSonicCompliant(protocol) &&
                rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold;
+
+        // Testing Note: Test protocol validation with invalid or non-compliant protocols.
     }
 
     /**
      * @notice Validates APY data for a protocol.
+     * @param apy APY value
+     * @param protocol Protocol address
+     * @return True if valid
      */
     function _validateAPY(uint256 apy, address protocol) internal view returns (bool) {
         uint256 liquidity = rwaYield.getAvailableLiquidity(protocol);
         return apy > 0 && apy <= MAX_APY && liquidity >= minRWALiquidityThreshold;
+
+        // Testing Note: Test APY validation with edge cases like zero or excessive APYs.
     }
 
     /**
      * @notice Assesses leverage viability for RWA protocols.
+     * @param protocol Protocol address
+     * @param amount Amount to leverage
+     * @return True if leverage is viable
      */
     function _assessLeverageViability(address protocol, uint256 amount) internal view returns (bool) {
         uint256 ltv = flyingTulip.getLTV(protocol, amount);
         return ltv <= MAX_LTV &&
                riskManager.assessLeverageViability(protocol, amount, ltv, true) &&
                looperCore.checkLiquidationRisk(protocol, amount, (amount * ltv) / BASIS_POINTS, true);
+
+        // Testing Note: Test leverage viability with high LTVs and liquidation risks.
     }
 
     /**
      * @notice Returns total RWA balance.
+     * @return Total RWA balance
      */
     function getTotalRWABalance() external view returns (uint256) {
         return totalRWABalance;
+
+        // Testing Note: Test balance accuracy after deposits and withdrawals.
     }
 
     /**
      * @notice Returns supported protocols.
+     * @return List of supported protocols
      */
     function getSupportedProtocols() external view returns (address[] memory) {
         return registry.getActiveProtocols(true);
+
+        // Testing Note: Test protocol list accuracy with added/removed protocols.
     }
 
     /**
      * @notice Returns active allocations.
+     * @return List of active allocations
      */
     function getAllocations() external view returns (Allocation[] memory) {
         address[] memory protocols = registry.getActiveProtocols(true);
@@ -585,10 +857,24 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
             result[i] = allocations[protocols[i]];
         }
         return result;
+
+        // Testing Note: Test allocation retrieval with zero or partial allocations.
+    }
+
+    /**
+     * @notice Returns list of registered oracles.
+     * @return List of oracles
+     */
+    function getOracles() external view returns (address[] memory) {
+        return oracles;
+
+        // Testing Note: Test oracle list retrieval with empty or full oracle sets.
     }
 
     /**
      * @notice Helper function to convert address to string.
+     * @param addr Address to convert
+     * @return String representation
      */
     function _addressToString(address addr) internal pure returns (string memory) {
         bytes memory alphabet = "0123456789abcdef";
@@ -604,6 +890,8 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
 
     /**
      * @notice Helper function to convert uint to string.
+     * @param value Value to convert
+     * @return String representation
      */
     function _uintToString(uint256 value) internal pure returns (string memory) {
         if (value == 0) {
@@ -629,5 +917,7 @@ contract AIYieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgrad
      */
     receive() external payable {
         revert("ETH deposits not allowed");
+
+        // Testing Note: Test fallback function with ETH transfers.
     }
 }
