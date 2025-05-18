@@ -11,7 +11,7 @@ interface ISonicProtocol {
 }
 
 interface IPointsTierManager {
-    function assignTier(address user, uint256 amount, bool useLockup, uint256 lockupDays) external;
+    function assignTier(address user, uint256 totalAmount, bool hasLockup, uint256 maxLockupDays) external;
     function getUserMultiplier(address user) external view returns (uint256);
 }
 
@@ -30,13 +30,23 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
     address public yieldOptimizer; // YieldOptimizer for point awards
     uint256 public totalFeeMonetizationRewards; // Total rewards accumulated
     mapping(address => uint256) public userPoints; // User Sonic Points balance
+    mapping(address => uint256) public claimableRewards; // User claimable rewards
 
     // Events
-    event PointsAwarded(address indexed user, uint256 points, bool isDeposit, uint256 multiplier);
+    event PointsAwarded(
+        address indexed user,
+        uint256 totalAmount,
+        uint256 points,
+        bool isDeposit,
+        bool hasLockup,
+        uint256 maxLockupDays
+    );
     event RewardsDeposited(address indexed sender, uint256 amount);
     event RewardsClaimed(address indexed recipient, uint256 amount);
+    event PointsClaimed(address indexed user, uint256 points);
     event PointsTierManagerUpdated(address indexed newPointsTierManager);
     event YieldOptimizerUpdated(address indexed newYieldOptimizer);
+    event GovernanceUpdated(address indexed newGovernance);
 
     // Modifiers
     modifier onlyGovernance() {
@@ -87,51 +97,70 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
         require(amount > 0, "Invalid amount");
         sonicSToken.safeTransferFrom(msg.sender, address(this), amount);
         totalFeeMonetizationRewards += amount;
+        bool success = sonicProtocol.depositFeeMonetizationRewards(address(this), amount);
+        require(success, "Sonic deposit failed");
         emit RewardsDeposited(msg.sender, amount);
     }
 
     /**
-     * @notice Claims accumulated rewards to governance.
+     * @notice Claims accumulated rewards to governance or users.
+     * @param recipient Address to receive rewards (governance or user)
      */
-    function claimRewards() external onlyGovernance {
-        uint256 rewards = totalFeeMonetizationRewards;
-        require(rewards > 0, "No rewards");
-        totalFeeMonetizationRewards = 0;
-        sonicSToken.safeTransfer(governance, rewards);
-        emit RewardsClaimed(governance, rewards);
+    function claimRewards(address recipient) external onlyGovernance {
+        require(recipient != address(0), "Invalid recipient");
+        uint256 amount = recipient == governance ? totalFeeMonetizationRewards : claimableRewards[recipient];
+        require(amount > 0, "No rewards to claim");
+
+        if (recipient == governance) {
+            totalFeeMonetizationRewards = 0;
+        } else {
+            claimableRewards[recipient] = 0;
+        }
+
+        sonicSToken.safeTransfer(recipient, amount);
+        emit RewardsClaimed(recipient, amount);
     }
 
     /**
      * @notice Awards Sonic Points with tiered multipliers for deposits or withdrawals.
      * @param user User address
-     * @param amount Amount of USDC involved
+     * @param totalAmount Total deposited amount (USDC, 6 decimals)
      * @param isDeposit True for deposits, false for withdrawals
-     * @param useLockup Whether to apply a lockup period
-     * @param lockupDays Lockup period in days (0, 30, or 90)
+     * @param hasLockup True if user has any active lockup
+     * @param maxLockupDays Longest lockup period in days (0, 30, or 90)
      */
     function awardPoints(
         address user,
-        uint256 amount,
+        uint256 totalAmount,
         bool isDeposit,
-        bool useLockup,
-        uint256 lockupDays
+        bool hasLockup,
+        uint256 maxLockupDays
     ) external onlyYieldOptimizer {
         require(user != address(0), "Invalid user");
-        require(amount > 0, "Invalid amount");
-        require(lockupDays == 0 || lockupDays == 30 || lockupDays == 90, "Invalid lockup period");
+        require(totalAmount >= 1 * 1e6, "Amount below minimum");
+        require(maxLockupDays == 0 || maxLockupDays == 30 || maxLockupDays == 90, "Invalid lockup period");
 
-        // Assign tier for deposits
+        // Update tier for deposits or withdrawals
+        pointsTierManager.assignTier(user, totalAmount, hasLockup, maxLockupDays);
+
+        // Calculate points using the user's current multiplier
+        uint256 multiplier = pointsTierManager.getUserMultiplier(user); // e.g., 200 (2x), 300 (3x), 500 (5x)
+        uint256 points = (totalAmount * multiplier) / 100; // Adjust for multiplier (100 = 1x)
+
+        // Update user points
         if (isDeposit) {
-            pointsTierManager.assignTier(user, amount, useLockup, lockupDays);
+            userPoints[user] += points;
+            // Allocate proportional rewards to user (e.g., based on points)
+            uint256 rewardShare = (totalFeeMonetizationRewards * points) / (totalFeeMonetizationRewards + points + 1);
+            claimableRewards[user] += rewardShare;
+        } else {
+            userPoints[user] = userPoints[user] >= points ? userPoints[user] - points : 0;
+            // Reduce claimable rewards proportionally
+            uint256 rewardShare = (claimableRewards[user] * points) / (userPoints[user] + points + 1);
+            claimableRewards[user] = claimableRewards[user] >= rewardShare ? claimableRewards[user] - rewardShare : 0;
         }
 
-        // Calculate points with tiered multiplier
-        uint256 multiplier = pointsTierManager.getUserMultiplier(user); // e.g., 100 (1x), 200 (2x), 300 (3x)
-        uint256 basePoints = isDeposit ? amount * 2 : amount; // 2x for deposits, 1x for withdrawals
-        uint256 points = (basePoints * multiplier) / 100; // Adjust for multiplier (100 = 1x)
-
-        userPoints[user] += points;
-        emit PointsAwarded(user, points, isDeposit, multiplier);
+        emit PointsAwarded(user, totalAmount, points, isDeposit, hasLockup, maxLockupDays);
     }
 
     /**
@@ -142,7 +171,6 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
         require(points > 0, "No points to claim");
         userPoints[msg.sender] = 0;
         // Placeholder: Post-airdrop, transfer $S tokens or equivalent
-        // Currently, emit event for tracking until Sonic airdrop is implemented
         emit PointsClaimed(msg.sender, points);
     }
 
@@ -173,10 +201,12 @@ contract StakingManager is UUPSUpgradeable, OwnableUpgradeable {
     function setGovernance(address _governance) external onlyOwner {
         require(_governance != address(0), "Invalid governance");
         governance = _governance;
+        emit GovernanceUpdated(_governance);
     }
 
     /**
      * @notice Authorizes contract upgrades.
+     * @param newImplementation Address of the new implementation
      */
-    function _authorizeUpgrade(address) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }
