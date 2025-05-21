@@ -354,7 +354,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         emit Deposit(msg.sender, netAmount, fee, discount, correlationId);
 
-        // Testing Note: Test fee discounts, lockup limits, and point awards.
+        // Testing Note: Test fee discounts, lockup limits, point awards, and allocation failures.
     }
 
     /**
@@ -394,7 +394,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         emit Withdraw(msg.sender, amount + netProfit, performanceFeeAmount, discount, correlationId);
         emit FeesCollected(feeRate, performanceFeeAmount, correlationId);
 
-        // Testing Note: Test profit calculations, lockup enforcement, and fee application.
+        // Testing Note: Test profit calculations, lockup enforcement, fee application, and partial withdrawals.
     }
 
     /**
@@ -417,7 +417,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         emit UserEmergencyWithdraw(msg.sender, amount, correlationId);
 
-        // Testing Note: Test emergency withdrawals during pause and lockup clearing.
+        // Testing Note: Test emergency withdrawals during pause, lockup clearing, and point updates.
     }
 
     /**
@@ -427,6 +427,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(_governanceVault != address(0), "Invalid GovernanceVault");
         governanceVault = IGovernanceVault(_governanceVault);
         emit GovernanceVaultUpdated(_governanceVault);
+
+        // Testing Note: Test GovernanceVault updates and fee discount impacts.
     }
 
     /**
@@ -436,6 +438,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         require(_pointsTierManager != address(0), "Invalid PointsTierManager");
         pointsTierManager = IPointsTierManager(_pointsTierManager);
         emit PointsTierManagerUpdated(_pointsTierManager);
+
+        // Testing Note: Test PointsTierManager updates and tier assignment impacts.
     }
 
     /**
@@ -453,6 +457,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         }
 
         return totalBalance >= lockedAmount ? totalBalance - lockedAmount : 0;
+
+        // Testing Note: Test with active and expired lockups.
     }
 
     /**
@@ -482,6 +488,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         while (lockups.length > writeIndex) {
             lockups.pop();
         }
+
+        // Testing Note: Test lockup updates with partial withdrawals and expired lockups.
     }
 
     /**
@@ -489,6 +497,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
      */
     function getUserLockups(address user) external view returns (Lockup[] memory) {
         return userLockups[user];
+
+        // Testing Note: Test with no lockups and multiple lockups.
     }
 
     /**
@@ -507,6 +517,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
                 }
             }
         }
+
+        // Testing Note: Test with active and expired lockups.
     }
 
     /**
@@ -535,7 +547,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         // Fetch APYs and risk scores
         uint256[] memory apys = new uint256[](end - start);
         for (uint256 i = start; i < end; i++) {
-            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
+            uint256 apy = sonicProtocol.getSonicAPY(protocols[i]);
+            if (defiYield.isDeFiProtocol(protocols[i])) {
+                (uint256 protocolAPY,,,) = defiYield.protocolScores(protocols[i]);
+                apy = protocolAPY > 0 ? protocolAPY : apy;
+            }
+            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], apy);
         }
 
         uint256 totalBalance = stablecoin.balanceOf(address(this)) + aiYieldOptimizer.getTotalRWABalance();
@@ -589,7 +606,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount, correlationId);
         }
 
-        // Testing Note: Test pagination, partial rebalancing, and RWA delegation failures.
+        // Testing Note: Test pagination, partial rebalancing, RWA delegation failures, and APY synchronization.
     }
 
     /**
@@ -607,6 +624,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             sum += amounts[i];
         }
         return sum <= totalAmount && sum >= totalAmount * 95 / 100;
+
+        // Testing Note: Test with mismatched arrays and invalid RWA protocols.
     }
 
     /**
@@ -617,6 +636,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             rwaYield.getAvailableLiquidity(protocol) >= minRWALiquidityThreshold &&
             registry.isValidProtocol(protocol) &&
             sonicProtocol.isSonicCompliant(protocol);
+
+        // Testing Note: Test with low liquidity or non-compliant protocols.
     }
 
     /**
@@ -625,6 +646,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     function _assessLeverageViability(address protocol, uint256 amount) internal view returns (bool) {
         uint256 ltv = _getLTV(protocol, amount);
         return riskManager.assessLeverageViability(protocol, amount, ltv, false);
+
+        // Testing Note: Test with varying LTVs and protocol types.
     }
 
     /**
@@ -639,6 +662,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             return 5000; // 50% LTV
         }
         return 0;
+
+        // Testing Note: Test LTV calculations for each protocol type.
     }
 
     /**
@@ -647,6 +672,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     function pause() external onlyGovernance {
         isPaused = true;
         emit PauseToggled(true);
+
+        // Testing Note: Test pause/unpause transitions and emergency withdrawals.
     }
 
     /**
@@ -663,6 +690,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
     function updateBlacklist(address user, bool status) external onlyGovernance {
         blacklistedUsers[user] = status;
         emit BlacklistUpdated(user, status);
+
+        // Testing Note: Test blacklist impacts on deposits/withdrawals.
     }
 
     /**
@@ -670,6 +699,8 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
      */
     function manualUpkeep() external onlyGovernance {
         upkeepManager.manualUpkeep(false);
+
+        // Testing Note: Test upkeep effects on protocol scores and allocations.
     }
 
     /**
@@ -682,7 +713,12 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         uint256[] memory apys = new uint256[](end - start);
         for (uint256 i = start; i < end; i++) {
-            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], sonicProtocol.getSonicAPY(protocols[i]));
+            uint256 apy = sonicProtocol.getSonicAPY(protocols[i]);
+            if (defiYield.isDeFiProtocol(protocols[i])) {
+                (uint256 protocolAPY,,,) = defiYield.protocolScores(protocols[i]);
+                apy = protocolAPY > 0 ? protocolAPY : apy;
+            }
+            apys[i - start] = riskManager.getRiskAdjustedAPY(protocols[i], apy);
         }
 
         uint256 totalWeightedAPY = 0;
@@ -725,7 +761,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             emit RWADelegatedToAI(address(aiYieldOptimizer), rwaAmount, correlationId);
         }
 
-        // Testing Note: Test pagination, allocation failures, and RWA delegation.
+        // Testing Note: Test pagination, allocation failures, RWA delegation, and APY synchronization.
     }
 
     /**
@@ -772,15 +808,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         _cleanAllocations();
         return totalWithdrawn;
 
-                // Testing Note: Test partial withdrawals, protocol failures, and point updates.
+        // Testing Note: Test partial withdrawals, protocol failures, point updates, and RWA withdrawals.
     }
 
     /**
      * @notice Deposits funds to a protocol.
-     * @param protocol Protocol address
-     * @param amount Amount to deposit
-     * @param isLeveraged Whether to apply leverage
-     * @param correlationId Unique ID for event tracing
      */
     function _depositToProtocol(address protocol, uint256 amount, bool isLeveraged, bytes32 correlationId) internal {
         stablecoin.safeApprove(protocol, 0);
@@ -809,14 +841,10 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
     /**
      * @notice Withdraws funds from a protocol.
-     * @param protocol Protocol address
-     * @param amount Amount to withdraw
-     * @param correlationId Unique ID for event tracing
-     * @return withdrawn Amount withdrawn
      */
     function _withdrawFromProtocol(address protocol, uint256 amount, bytes32 correlationId) internal returns (uint256) {
         uint256 balanceBefore = stablecoin.balanceOf(address(this));
-        uint256 withdrawn = 0;
+        uint256 withdrawn;
         try
             protocol == address(flyingTulip)
                 ? flyingTulip.withdrawFromPool(protocol, amount)
@@ -829,6 +857,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
             withdrawn = amountWithdrawn;
         } catch {
             emit AIAllocationOptimized(protocol, 0, 0, false, correlationId);
+            return 0;
         }
         require(stablecoin.balanceOf(address(this)) >= balanceBefore + withdrawn, "Withdrawal balance mismatch");
         return withdrawn;
@@ -852,28 +881,25 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
     /**
      * @notice Validates a protocol.
-     * @param protocol Protocol address
-     * @return True if valid
      */
     function _isValidProtocol(address protocol) internal view returns (bool) {
         return registry.isValidProtocol(protocol) && sonicProtocol.isSonicCompliant(protocol);
+
+        // Testing Note: Test with invalid or non-compliant protocols.
     }
 
     /**
      * @notice Validates APY data.
-     * @param apy APY value
-     * @param protocol Protocol address
-     * @return True if valid
      */
     function _validateAPY(uint256 apy, address protocol) internal view returns (bool) {
         uint256 liquidity = getProtocolLiquidity(protocol);
         return apy > 0 && apy <= MAX_APY && liquidity > 0;
+
+        // Testing Note: Test with zero APY, excessive APY, or zero liquidity.
     }
 
     /**
      * @notice Gets protocol liquidity.
-     * @param protocol Protocol address
-     * @return liquidity Available liquidity
      */
     function getProtocolLiquidity(address protocol) public view returns (uint256 liquidity) {
         require(_isValidProtocol(protocol), "Invalid protocol");
@@ -898,9 +924,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
     /**
      * @notice Calculates user profit with real-time DeFiYield data.
-     * @param user User address
-     * @param amount Amount to calculate profit for
-     * @return profit Estimated profit
      */
     function _calculateProfit(address user, uint256 amount) internal view returns (uint256) {
         uint256 userBalance = userBalances[user];
@@ -915,7 +938,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         for (uint256 i = 0; i < protocols.length; i++) {
             Allocation memory alloc = allocations[protocols[i]];
             if (alloc.amount == 0) continue;
-            
+
             // Sync APY with DeFiYield for non-RWA protocols
             uint256 apy = alloc.apy;
             if (!rwaYield.isRWA(protocols[i]) && defiYield.isDeFiProtocol(protocols[i])) {
@@ -948,14 +971,11 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         return totalProfit >= MIN_PROFIT ? totalProfit : 0;
 
-        // Testing Note: Test profit calculations with real-time DeFiYield APYs, zero APYs, and large time intervals.
+        // Testing Note: Test profit calculations with real-time DeFiYield APYs, zero APYs, large time intervals, and RWA balances.
     }
 
     /**
      * @notice Gets user balance and estimated profits.
-     * @param user User address
-     * @return balance User balance
-     * @return estimatedProfit Estimated profit
      */
     function getUserBalance(address user) external view returns (uint256 balance, uint256 estimatedProfit) {
         balance = userBalances[user];
@@ -966,7 +986,6 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
     /**
      * @notice Gets allocation breakdown.
-     * @return breakdown Detailed allocation data
      */
     function getAllocationBreakdown() external view returns (AllocationBreakdown[] memory) {
         address[] memory protocols = registry.getActiveProtocols(false);
@@ -976,10 +995,15 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         for (uint256 i = 0; i < protocols.length; i++) {
             Allocation memory alloc = allocations[protocols[i]];
             if (alloc.amount == 0) continue;
+            uint256 apy = alloc.apy;
+            if (defiYield.isDeFiProtocol(protocols[i])) {
+                (uint256 protocolAPY,,,) = defiYield.protocolScores(protocols[i]);
+                apy = protocolAPY > 0 ? protocolAPY : alloc.apy;
+            }
             breakdown[breakdownIndex] = AllocationBreakdown({
                 protocol: protocols[i],
                 amount: alloc.amount,
-                apy: alloc.apy,
+                apy: apy,
                 isLeveraged: alloc.isLeveraged,
                 liquidity: getProtocolLiquidity(protocols[i]),
                 riskScore: registry.getProtocolRiskScore(protocols[i])
@@ -1008,7 +1032,7 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
 
         return finalBreakdown;
 
-        // Testing Note: Test breakdown accuracy with zero allocations and RWA balances.
+        // Testing Note: Test breakdown accuracy with zero allocations, RWA balances, and real-time APY updates.
     }
 
     /**
@@ -1020,5 +1044,3 @@ contract YieldOptimizer is UUPSUpgradeable, OwnableUpgradeable, PausableUpgradea
         // Testing Note: Test fallback function with ETH transfers.
     }
 }
-
-   
