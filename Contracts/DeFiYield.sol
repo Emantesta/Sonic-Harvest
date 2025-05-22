@@ -5,6 +5,7 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
@@ -16,8 +17,8 @@ interface IRedstoneOracle {
 
 // Interface for StakingManager
 interface IStakingManager {
-    function depositRewards(uint256 amount) external;
-    function getStakingCycle() external view returns (uint256 start, uint256 end, uint256 duration);
+    function depositRewards(uint256 amount, address token) external;
+    function awardPoints(address user, uint256 totalAmount, bool isDeposit) external;
 }
 
 // Standardized DeFiYield interface
@@ -31,21 +32,30 @@ interface IDeFiYield {
 
 /**
  * @title DeFiYield
- * @dev Yield aggregator for Sonic DeFi protocols with AI-driven strategies and multi-oracle integration.
- * @notice Upgradable contract optimized for yield and profit distribution.
+ * @dev Yield aggregator for Sonic DeFi protocols with a 10% performance fee.
+ * @notice 10% of the performance fee is sent to StakingManager for rewards.
  */
-contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable, IDeFiYield {
+contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, UUPSUpgradeable, IDeFiYield {
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using SafeMathUpgradeable for uint256;
 
     // Immutable stablecoin (USDC)
     IERC20Upgradeable public immutable stablecoin;
     IStakingManager public stakingManager;
+    address public feeRecipient; // Governance/treasury for performance fees
+    uint256 public performanceFee; // In basis points (e.g., 1000 = 10%)
+    uint256 public stakingRewardShare; // Share of perf fee to StakingManager (e.g., 1000 = 10%)
+    uint256 private constant BASIS_POINTS = 10000;
 
     // Protocol and balance management
     mapping(address => bool) public supportedProtocols;
     mapping(address => uint256) public defiBalances;
     uint256 public totalDeFiBalance;
+
+    // User profit tracking
+    mapping(address => uint256) public userDeposits;
+    mapping(address => uint256) public userProfits;
+    uint256 public totalDeposits;
 
     // Oracle management
     struct OracleConfig {
@@ -93,9 +103,16 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
     // Events
     event DepositDeFi(address indexed protocol, uint256 amount, bytes32 indexed correlationId);
     event WithdrawDeFi(address indexed protocol, uint256 amount, uint256 profit, bytes32 indexed correlationId);
+    event ProfitAllocated(address indexed user, uint256 profit, bytes32 indexed correlationId);
+    event ProfitClaimed(address indexed user, uint256 amount);
+    event PerformanceFeeCollected(address indexed feeRecipient, uint256 amount, bytes32 indexed correlationId);
+    event StakingRewardSent(address indexed stakingManager, uint256 amount, bytes32 indexed correlationId);
     event ProtocolUpdated(address indexed protocol, bool isSupported);
     event ProtocolConfigUpdated(address indexed protocol, bytes4 depositSelector, bytes4 withdrawSelector);
     event StakingManagerUpdated(address indexed newStakingManager);
+    event FeeRecipientUpdated(address indexed newFeeRecipient);
+    event PerformanceFeeUpdated(uint256 newFee);
+    event StakingRewardShareUpdated(uint256 newShare);
     event OracleUpdated(address indexed protocol, address chainlinkFeed, address redstoneFeed);
     event OracleFailure(address indexed protocol, string reason);
     event UserStrategyUpdated(address indexed user, uint256 riskTolerance, uint256 yieldPreference);
@@ -111,27 +128,29 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
 
     /**
      * @notice Initializes the contract.
-     * @param _protocols Protocol addresses
-     * @param _oracleConfigs Oracle configurations
-     * @param _stakingManager StakingManager address
-     * @param _protocolConfigs Protocol function selectors
      */
     function initialize(
         address[] memory _protocols,
         OracleConfig[] memory _oracleConfigs,
         address _stakingManager,
+        address _feeRecipient,
         ProtocolConfig[] memory _protocolConfigs
     ) external initializer {
         require(_stakingManager != address(0), "Invalid StakingManager address");
+        require(_feeRecipient != address(0), "Invalid feeRecipient address");
         require(
             _protocols.length == _oracleConfigs.length && _protocols.length == _protocolConfigs.length,
             "Array length mismatch"
         );
         __Ownable_init(msg.sender);
         __ReentrancyGuard_init();
+        __Pausable_init();
         __UUPSUpgradeable_init();
 
         stakingManager = IStakingManager(_stakingManager);
+        feeRecipient = _feeRecipient;
+        performanceFee = 1000; // 10%
+        stakingRewardShare = 1000; // 10% of performance fee
         aiUpdateInterval = 1 days;
 
         oracleDefaults = OracleDefaults({
@@ -160,11 +179,8 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
 
     /**
      * @notice Deposits stablecoins into a DeFi protocol.
-     * @param protocol Protocol address
-     * @param amount Amount to deposit (6 decimals)
-     * @param correlationId Unique ID for event tracing
      */
-    function depositToDeFi(address protocol, uint256 amount, bytes32 correlationId) external override nonReentrant {
+    function depositToDeFi(address protocol, uint256 amount, bytes32 correlationId) external override nonReentrant whenNotPaused {
         require(msg.sender == owner(), "Only YieldOptimizer");
         require(supportedProtocols[protocol] && protocolConfigs[protocol].isActive, "Unsupported protocol");
         require(amount > 0, "Amount must be > 0");
@@ -182,22 +198,21 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
 
         defiBalances[protocol] = defiBalances[protocol].add(amount);
         totalDeFiBalance = totalDeFiBalance.add(amount);
-        emit DepositDeFi(protocol, amount, correlationId);
+        userDeposits[msg.sender] = userDeposits[msg.sender].add(amount);
+        totalDeposits = totalDeposits.add(amount);
+        stakingManager.awardPoints(msg.sender, amount, true);
 
-        // Testing Note: Test edge cases like failed protocol calls, insufficient allowance, or invalid selectors.
+        emit DepositDeFi(protocol, amount, correlationId);
     }
 
     /**
-     * @notice Withdraws stablecoins and profits.
-     * @param protocol Protocol address
-     * @param amount Amount to withdraw (6 decimals)
-     * @param correlationId Unique ID for event tracing
-     * @return withdrawn Amount withdrawn
+     * @notice Withdraws stablecoins and allocates profits with performance fee.
      */
     function withdrawFromDeFi(address protocol, uint256 amount, bytes32 correlationId)
         external
         override
         nonReentrant
+        whenNotPaused
         returns (uint256)
     {
         require(msg.sender == owner(), "Only YieldOptimizer");
@@ -220,14 +235,42 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
         uint256 profit = withdrawn > initialBalance ? withdrawn.sub(initialBalance) : 0;
         defiBalances[protocol] = defiBalances[protocol].sub(amount);
         totalDeFiBalance = totalDeFiBalance.sub(amount);
+        userDeposits[msg.sender] = userDeposits[msg.sender].sub(amount);
+        totalDeposits = totalDeposits.sub(amount);
+        stakingManager.awardPoints(msg.sender, amount, false);
+
+        if (profit > 0) {
+            // Calculate performance fee
+            uint256 perfFee = profit.mul(performanceFee).div(BASIS_POINTS);
+            uint256 userProfit = profit.sub(perfFee);
+
+            // Allocate user profit
+            userProfits[msg.sender] = userProfits[msg.sender].add(userProfit);
+            emit ProfitAllocated(msg.sender, userProfit, correlationId);
+
+            // Handle performance fee
+            if (perfFee > 0) {
+                uint256 stakingShare = perfFee.mul(stakingRewardShare).div(BASIS_POINTS);
+                uint256 recipientShare = perfFee.sub(stakingShare);
+
+                // Send to feeRecipient
+                if (recipientShare > 0) {
+                    stablecoin.safeTransfer(feeRecipient, recipientShare);
+                    emit PerformanceFeeCollected(feeRecipient, recipientShare, correlationId);
+                }
+
+                // Send to StakingManager
+                if (stakingShare > 0) {
+                    stablecoin.safeApprove(address(stakingManager), 0);
+                    stablecoin.safeApprove(address(stakingManager), stakingShare);
+                    stakingManager.depositRewards(stakingShare, address(stablecoin));
+                    emit StakingRewardSent(address(stakingManager), stakingShare, correlationId);
+                }
+            }
+        }
 
         if (withdrawn > 0) {
             stablecoin.safeTransfer(msg.sender, withdrawn);
-            if (profit > 0 && _isOptimalDepositTime()) {
-                stablecoin.safeApprove(address(stakingManager), 0);
-                stablecoin.safeApprove(address(stakingManager), profit);
-                stakingManager.depositRewards(profit);
-            }
         }
 
         if (defiBalances[protocol] == 0) {
@@ -236,230 +279,127 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
 
         emit WithdrawDeFi(protocol, amount, profit, correlationId);
         return withdrawn;
+    }
 
-        // Testing Note: Test failed withdrawals, partial withdrawals, StakingManager reverts, and profit calculation accuracy.
+    /**
+     * @notice Allows users to claim their allocated profits.
+     */
+    function claimProfits() external nonReentrant whenNotPaused {
+        uint256 profit = userProfits[msg.sender];
+        require(profit > 0, "No profits to claim");
+
+        userProfits[msg.sender] = 0;
+        stablecoin.safeTransfer(msg.sender, profit);
+        emit ProfitClaimed(msg.sender, profit);
+    }
+
+    /**
+     * @notice Updates performance fee.
+     */
+    function updatePerformanceFee(uint256 newFee) external onlyOwner {
+        require(newFee <= 2000, "Fee too high"); // Max 20%
+        performanceFee = newFee;
+        emit PerformanceFeeUpdated(newFee);
+    }
+
+    /**
+     * @notice Updates staking reward share.
+     */
+    function updateStakingRewardShare(uint256 newShare) external onlyOwner {
+        require(newShare <= 5000, "Share too high"); // Max 50%
+        stakingRewardShare = newShare;
+        emit StakingRewardShareUpdated(newShare);
+    }
+
+    /**
+     * @notice Updates fee recipient with validation.
+     */
+    function updateFeeRecipient(address newRecipient) external onlyOwner {
+        require(newRecipient != address(0), "Invalid recipient");
+        // Ensure recipient is EOA or contract capable of receiving tokens
+        require(newRecipient.code.length == 0 || newRecipient.isContract(), "Invalid recipient contract");
+        feeRecipient = newRecipient;
+        emit FeeRecipientUpdated(newRecipient);
+    }
+
+    /**
+     * @notice Updates staking manager.
+     */
+    function updateStakingManager(address newStakingManager) external onlyOwner {
+        require(newStakingManager != address(0), "Invalid StakingManager address");
+        stakingManager = IStakingManager(newStakingManager);
+        emit StakingManagerUpdated(newStakingManager);
+    }
+
+    /**
+     * @notice Pauses the contract.
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Unpauses the contract.
+     */
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /**
      * @notice Checks if a protocol is supported.
-     * @param protocol Protocol address
-     * @return True if supported
      */
     function isDeFiProtocol(address protocol) external view override returns (bool) {
-        return supportedProtocols[protocol] && protocolConfigs[protocol].isActive;
-
-        // Testing Note: Test with inactive or unsupported protocols.
+        return supportedProtocols[protocol];
     }
 
     /**
-     * @notice Gets available liquidity for a protocol.
-     * @param protocol Protocol address
-     * @return Available liquidity (6 decimals)
+     * @notice Gets available liquidity for a protocol (placeholder).
      */
     function getAvailableLiquidity(address protocol) external view override returns (uint256) {
-        require(supportedProtocols[protocol], "Unsupported protocol");
-        return protocolScores[protocol].tvl > 0 ? protocolScores[protocol].tvl : oracleDefaults.defaultTVL;
-
-        // Testing Note: Test with real protocol liquidity feeds and edge cases like zero TVL or oracle failures.
+        // Placeholder: Implement actual liquidity check based on protocol
+        return defiBalances[protocol];
     }
 
     /**
      * @notice Gets total DeFi balance.
-     * @return Total balance across all protocols
      */
     function getTotalDeFiBalance() external view override returns (uint256) {
         return totalDeFiBalance;
-
-        // Testing Note: Test with zero balances or after deposits/withdrawals.
     }
 
     /**
-     * @notice Gets protocol scores.
-     * @param protocol Protocol address
-     * @return apy, tvl, riskScore, score
+     * @notice Updates protocol support.
      */
-    function protocolScores(address protocol) external view returns (uint256, uint256, uint256, uint256) {
-        ProtocolScore memory score = protocolScores[protocol];
-        return (score.apy, score.tvl, score.riskScore, score.score);
-
-        // Testing Note: Test with protocols lacking oracle data or zero scores.
+    function updateProtocol(address protocol, bool isSupported) external onlyOwner {
+        require(protocol != address(0), "Invalid protocol address");
+        supportedProtocols[protocol] = isSupported;
+        emit ProtocolUpdated(protocol, isSupported);
     }
 
     /**
-     * @notice Executes AI-driven reallocation.
-     * @param protocols Protocols to allocate to
-     * @param amounts Amounts to allocate
-     * @param correlationId Unique ID for event tracing
+     * @notice Updates protocol configuration.
      */
-    function executeAIAllocation(address[] memory protocols, uint256[] memory amounts, bytes32 correlationId)
-        external
-        nonReentrant
-        onlyOwner
-    {
-        require(protocols.length == amounts.length, "Array length mismatch");
-        require(
-            block.timestamp >= userStrategies[msg.sender].lastUpdated + aiUpdateInterval,
-            "AI update interval not elapsed"
-        );
-
-        _updateProtocolScores();
-        AIStrategy memory strategy = userStrategies[msg.sender];
-
-        for (uint256 i = 0; i < protocols.length; i++) {
-            require(supportedProtocols[protocols[i]], "Unsupported protocol");
-            uint256 score = _computeProtocolScore(protocols[i], strategy);
-            if (score > 0 && amounts[i] > 0) {
-                depositToDeFi(protocols[i], amounts[i], correlationId);
-                emit AIAllocation(protocols[i], amounts[i], score, correlationId);
-            }
-        }
-        userStrategies[msg.sender].lastUpdated = block.timestamp;
-
-        // Testing Note: Test AI allocation with invalid protocols, zero amounts, or outdated strategies.
+    function updateProtocolConfig(address protocol, bytes4 depositSelector, bytes4 withdrawSelector) external onlyOwner {
+        require(protocol != address(0), "Invalid protocol address");
+        protocolConfigs[protocol] = ProtocolConfig({
+            depositSelector: depositSelector,
+            withdrawSelector: withdrawSelector,
+            isActive: true
+        });
+        emit ProtocolConfigUpdated(protocol, depositSelector, withdrawSelector);
     }
 
     /**
-     * @notice Computes protocol score.
+     * @notice Updates oracle configuration.
      */
-    function _computeProtocolScore(address protocol, AIStrategy memory strategy)
-        internal
-        view
-        returns (uint256)
-    {
-        ProtocolScore memory score = protocolScores[protocol];
-        uint256 apyWeight = strategy.yieldPreference.mul(100).div(100);
-        uint256 riskWeight = (100 - strategy.riskTolerance).mul(100).div(100);
-        uint256 tvlWeight = 50;
-
-        return
-            (score.apy.mul(apyWeight)).add(score.tvl.mul(tvlWeight)).sub(score.riskScore.mul(riskWeight)).div(100);
-
-        // Testing Note: Test with extreme risk/yield preferences and zero scores.
-    }
-
-    /**
-     * @notice Updates protocol scores.
-     */
-    function _updateProtocolScores() internal {
-        uint256 length = oracleProtocols.length;
-        for (uint256 i = 0; i < length; i++) {
-            address protocol = oracleProtocols[i];
-            if (supportedProtocols[protocol] && protocolOracles[protocol].isActive) {
-                (uint256 apy, uint256 tvl, uint256 risk) = _getOracleData(protocol);
-                protocolScores[protocol].apy = apy;
-                protocolScores[protocol].tvl = tvl;
-                protocolScores[protocol].riskScore = risk;
-                protocolScores[protocol].score = 0;
-            }
-        }
-
-        // Testing Note: Test oracle failures and default value fallbacks.
-    }
-
-    /**
-     * @notice Fetches oracle data with fallbacks.
-     */
-    function _getOracleData(address protocol)
-        internal
-        view
-        returns (uint256 apy, uint256 tvl, uint256 riskScore)
-    {
-        OracleConfig memory config = protocolOracles[protocol];
-        bool success;
-
-        // APY
-        if (config.chainlinkFeed != address(0)) {
-            try AggregatorV3Interface(config.chainlinkFeed).latestRoundData() returns (
-                uint80,
-                int256 answer,
-                uint256,
-                uint256,
-                uint80
-            ) {
-                apy = uint256(answer);
-                success = true;
-            } catch {
-                emit OracleFailure(protocol, "Chainlink APY fetch failed");
-            }
-        }
-
-        if (!success && config.redstoneFeed != address(0)) {
-            try IRedstoneOracle(config.redstoneFeed).latestRoundData(config.redstoneFeed) returns (
-                uint80,
-                int256 answer,
-                uint256,
-                uint256,
-                uint80
-            ) {
-                apy = uint256(answer);
-                success = true;
-            } catch {
-                emit OracleFailure(protocol, "Redstone APY fetch failed");
-            }
-        }
-
-        if (!success) {
-            apy = oracleDefaults.defaultAPY;
-            emit OracleFailure(protocol, "All APY oracles failed, using default");
-        }
-
-        // TVL
-        success = false;
-        if (config.chainlinkFeed != address(0)) {
-            try AggregatorV3Interface(config.chainlinkFeed).latestRoundData() returns (
-                uint80,
-                int256 answer,
-                uint256,
-                uint256,
-                uint80
-            ) {
-                tvl = uint256(answer);
-                success = true;
-            } catch {
-                emit OracleFailure(protocol, "Chainlink TVL fetch failed");
-            }
-        }
-
-        if (!success) {
-            tvl = oracleDefaults.defaultTVL;
-            emit OracleFailure(protocol, "TVL fetch failed, using default");
-        }
-
-        // Risk Score
-        success = false;
-        if (config.redstoneFeed != address(0)) {
-            try IRedstoneOracle(config.redstoneFeed).latestRoundData(config.redstoneFeed) returns (
-                uint80,
-                int256 answer,
-                uint256,
-                uint256,
-                uint80
-            ) {
-                riskScore = uint256(answer);
-                success = true;
-            } catch {
-                emit OracleFailure(protocol, "Redstone risk fetch failed");
-            }
-        }
-
-        if (!success) {
-            riskScore = oracleDefaults.defaultRiskScore;
-            emit OracleFailure(protocol, "Risk fetch failed, using default");
-        }
-
-        // Testing Note: Test Chainlink/Redstone failures and fallback to defaults.
-    }
-
-    /**
-     * @notice Checks optimal deposit time for staking rewards.
-     */
-    function _isOptimalDepositTime() internal view returns (bool) {
-        (uint256 start, uint256 end, ) = stakingManager.getStakingCycle();
-        uint256 currentTime = block.timestamp;
-        uint256 optimalWindow = end.sub(start).div(4);
-        return currentTime >= start && currentTime <= start.add(optimalWindow);
-
-        // Testing Note: Test with different staking cycle configurations.
+    function updateOracle(address protocol, address chainlinkFeed, address redstoneFeed) external onlyOwner {
+        require(protocol != address(0), "Invalid protocol address");
+        protocolOracles[protocol] = OracleConfig({
+            chainlinkFeed: chainlinkFeed,
+            redstoneFeed: redstoneFeed,
+            isActive: true
+        });
+        emit OracleUpdated(protocol, chainlinkFeed, redstoneFeed);
     }
 
     /**
@@ -473,158 +413,29 @@ contract DeFiYield is OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgrad
             lastUpdated: block.timestamp
         });
         emit UserStrategyUpdated(msg.sender, riskTolerance, yieldPreference);
-
-        // Testing Note: Test with invalid parameters and frequent updates.
     }
 
     /**
-     * @notice Updates protocol support and configuration.
+     * @notice Emergency withdrawal from a protocol.
      */
-    function updateProtocol(
-        address protocol,
-        bool isSupported,
-        bytes4 depositSelector,
-        bytes4 withdrawSelector,
-        address chainlinkFeed,
-        address redstoneFeed
-    ) external onlyOwner {
-        require(protocol != address(0), "Invalid protocol address");
-        supportedProtocols[protocol] = isSupported;
-        if (isSupported) {
-            protocolConfigs[protocol] = ProtocolConfig({
-                depositSelector: depositSelector,
-                withdrawSelector: withdrawSelector,
-                isActive: true
-            });
-            protocolOracles[protocol] = OracleConfig({
-                chainlinkFeed: chainlinkFeed,
-                redstoneFeed: redstoneFeed,
-                isActive: true
-            });
-            bool exists = false;
-            for (uint256 i = 0; i < oracleProtocols.length; i++) {
-                if (oracleProtocols[i] == protocol) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                oracleProtocols.push(protocol);
-            }
-        } else {
-            protocolConfigs[protocol].isActive = false;
-            protocolOracles[protocol].isActive = false;
-            if (defiBalances[protocol] == 0) {
-                stablecoin.safeApprove(protocol, 0);
-            }
-        }
-        emit ProtocolUpdated(protocol, isSupported);
-        emit ProtocolConfigUpdated(protocol, depositSelector, withdrawSelector);
-        emit OracleUpdated(protocol, chainlinkFeed, redstoneFeed);
+    function emergencyWithdraw(address protocol, uint256 amount, bytes32 correlationId) external onlyOwner {
+        require(supportedProtocols[protocol], "Unsupported protocol");
+        require(amount > 0 && amount <= defiBalances[protocol], "Invalid amount");
 
-        // Testing Note: Test protocol addition/removal, duplicate protocols, and approval cleanup.
-    }
-
-    /**
-     * @notice Updates oracle defaults.
-     */
-    function updateOracleDefaults(uint256 defaultAPY, uint256 defaultTVL, uint256 defaultRiskScore)
-        external
-        onlyOwner
-    {
-        oracleDefaults = OracleDefaults({
-            defaultAPY: defaultAPY,
-            defaultTVL: defaultTVL,
-            defaultRiskScore: defaultRiskScore
-        });
-
-        // Testing Note: Test impact of default value changes on AI scoring.
-    }
-
-    /**
-     * @notice Emergency withdraw in batches.
-     */
-    function emergencyWithdrawAll(uint256 start, uint256 limit, bytes32 correlationId)
-        external
-        nonReentrant
-        onlyOwner
-    {
-        require(start < oracleProtocols.length, "Invalid start index");
-        uint256 end = start.add(limit) > oracleProtocols.length ? oracleProtocols.length : start.add(limit);
-
-        for (uint256 i = start; i < end; i++) {
-            address protocol = oracleProtocols[i];
-            if (supportedProtocols[protocol] && defiBalances[protocol] > 0) {
-                uint256 amount = withdrawFromDeFi(protocol, defiBalances[protocol], correlationId);
-                emit EmergencyWithdraw(protocol, amount, correlationId);
-            }
-        }
-
-        // Testing Note: Test pagination, partial withdrawals, and gas limits with large protocol sets.
-    }
-
-    /**
-     * @notice Batch reallocation.
-     */
-    function batchReallocate(
-        address[] memory fromProtocols,
-        address[] memory toProtocols,
-        uint256[] memory amounts,
-        bytes32 correlationId
-    ) external nonReentrant onlyOwner {
-        require(
-            fromProtocols.length == toProtocols.length && fromProtocols.length == amounts.length,
-            "Array length mismatch"
+        (bool success, bytes memory data) = protocol.call(
+            abi.encodeWithSelector(protocolConfigs[protocol].withdrawSelector, address(stablecoin), amount)
         );
+        require(success, "Emergency withdraw failed");
 
-        _batchUpdateApprovals(toProtocols, amounts);
+        uint256 withdrawn = abi.decode(data, (uint256));
+        defiBalances[protocol] = defiBalances[protocol].sub(amount);
+        totalDeFiBalance = totalDeFiBalance.sub(amount);
 
-        for (uint256 i = 0; i < fromProtocols.length; i++) {
-            uint256 withdrawn = withdrawFromDeFi(fromProtocols[i], amounts[i], correlationId);
-            if (withdrawn > 0) {
-                depositToDeFi(toProtocols[i], withdrawn, correlationId);
-            }
+        if (withdrawn > 0) {
+            stablecoin.safeTransfer(owner(), withdrawn);
         }
 
-        // Testing Note: Test reallocation with failed withdrawals or deposits, and verify balance updates.
-    }
-
-    /**
-     * @notice Batch updates approvals.
-     */
-    function _batchUpdateApprovals(address[] memory protocols, uint256[] memory amounts) internal {
-        for (uint256 i = 0; i < protocols.length; i++) {
-            if (amounts[i] > 0 && supportedProtocols[protocols[i]]) {
-                uint256 allowance = stablecoin.allowance(address(this), protocols[i]);
-                if (allowance < amounts[i]) {
-                    stablecoin.safeApprove(protocols[i], 0);
-                    stablecoin.safeApprove(protocols[i], type(uint256).max);
-                }
-            }
-        }
-
-        // Testing Note: Test approval updates with large protocol sets and insufficient balances.
-    }
-
-    /**
-     * @notice Updates StakingManager.
-     */
-    function setStakingManager(address _stakingManager) external onlyOwner {
-        require(_stakingManager != address(0), "Invalid StakingManager address");
-        stablecoin.safeApprove(address(stakingManager), 0);
-        stakingManager = IStakingManager(_stakingManager);
-        emit StakingManagerUpdated(_stakingManager);
-
-        // Testing Note: Test StakingManager updates and reward deposit failures.
-    }
-
-    /**
-     * @notice Prevents accidental ETH deposits.
-     */
-    receive() external payable {
-        revert("ETH deposits not allowed");
-
-        // Testing Note: Test fallback function with ETH transfers.
+        emit EmergencyWithdraw(protocol, amount, correlationId);
     }
 
     /**
